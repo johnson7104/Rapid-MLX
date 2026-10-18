@@ -6,7 +6,7 @@
 ## Highlights
 
 - **Image endpoint authentication**: image endpoints now require the API key when `--api-key` is set.
-- **Personal Intelligence removed**: Desktop now uses the ordinary Chat path. `/v1/models` cards no longer include `personal_intelligence_profile` or `personal_intelligence_qualification`; `/v1/agent/runs` remains available with its existing runtime and client execution mode. Local file and command tools start off in Chat for anyone who had not changed them, while explicit choices are preserved. Privacy copy now explains online tool data sharing.
+- **Personal Intelligence removed**: Desktop now uses the ordinary Chat path. `/v1/models` cards no longer include `personal_intelligence_profile` or `personal_intelligence_qualification`; `/v1/agent/runs` remains available with its existing runtime and client execution mode. Local file and command tools have been removed from Chat. Built-in tools are Web Search, Browse Web Page, Weather, and Read Attached Document again, plus any connectors you add. Files you created are not touched. Privacy copy now explains online tool data sharing.
 
 - **LFM2.5-24B-A2B alias**: `rapid-mlx serve lfm2.5-24b-a2b-4bit` loads LiquidAI's official 4-bit MLX build with tool calling and reasoning parsing preconfigured.
 
