@@ -261,8 +261,17 @@ struct ChatView: View {
     /// The picker lives in the compose box now, not a top control bar.
     @Environment(DownloadManager.self) private var downloads
     @Environment(QuickstartCoordinator.self) private var quickstart
+    @Environment(\.controlActiveState) private var controlActiveState
 
-    @State private var draft: String = ""
+    private var draft: String { viewModel.composerDraft }
+    private var draftBinding: Binding<String> {
+        let conversationID = viewModel.activeConversationID
+        return Binding(get: { viewModel.composerDraft }, set: {
+            // Ignore a final callback from the editor being removed on switch.
+            guard viewModel.activeConversationID == conversationID else { return }
+            viewModel.composerDraft = $0
+        })
+    }
     @State private var attachmentDrafts = ChatAttachmentDraftStore()
     /// A rejected photo is a capability explanation, not an attachment
     /// failure. Keep it outside the conversation-keyed attachment draft so it
@@ -376,6 +385,13 @@ struct ChatView: View {
         }
         .onChange(of: viewModel.conversations.map(\.id)) { _, _ in pruneAttachmentDrafts() }
         .onChange(of: viewModel.activeConversationID) { _, _ in
+            // The conversation-keyed editor is replaced, so carry forward
+            // focus only from the composer in this window.
+            if controlActiveState == .key,
+               let editor = NSApp.keyWindow?.firstResponder as? AutosizingTextView,
+               editor.accessibilityIdentifier() == AutosizingTextView.composeAccessibilityIdentifier {
+                composeFocusToken &+= 1
+            }
             pruneAttachmentDrafts()
             photoCapabilityNotice.dismiss()
         }
@@ -831,7 +847,7 @@ struct ChatView: View {
                 // gated; the placeholder names the blocking step so the
                 // reason is visible before a single character is typed.
                 ComposeField(
-                    text: $draft,
+                    text: draftBinding,
                     focusToken: composeFocusToken,
                     isStreaming: viewModel.isStreaming,
                     placeholder: readiness.composerPlaceholder,
@@ -843,6 +859,8 @@ struct ChatView: View {
                         messages.last(where: { $0.role == .user })?.content
                     }
                 )
+                // A new editor also isolates marked IME text and undo history.
+                .id(viewModel.activeConversationID)
                 composerControls
             }
             .padding(.horizontal, RapidTheme.Space.md - 2)
@@ -1191,36 +1209,40 @@ struct ChatView: View {
     // MARK: - Actions
 
     private func send() {
-        let text = draft
-        guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                || attachmentDraft.hasAttachments else { return }
-        guard !viewModel.isStreaming else { return }
-        guard !attachmentDraft.isImportingFiles else { return }
-        guard attachmentDraft.images.isEmpty || supportsImageInput else {
-            rejectImageInputForCurrentModel()
-            return
-        }
-        // Return reaches here even when the Send button is disabled —
-        // AppKit routes the key through ``ComposeTextEditor`` regardless
-        // of SwiftUI's button state. Previously that landed on a silent
-        // no-op: the keystroke did nothing and nothing said why.
-        //
-        // Two guarantees here. The draft is NOT cleared (it is still
-        // exactly what the user typed, ready to send the moment the
-        // model is up), and the attempt is acknowledged — the banner
-        // flashes and VoiceOver speaks the same sentence the Send
-        // tooltip carries.
-        guard acknowledgeIfNotReady() else { return }
-        photoCapabilityNotice.dismiss()
-        draft = ""
-        let submission = attachmentDraft.takeSubmission()
-        composeFocusToken &+= 1
-        viewModel.send(
-            text,
-            alias: alias,
-            supportsImageInput: supportsImageInput,
-            imageAttachments: submission.images,
-            fileAttachments: submission.files
+        viewModel.submitComposerDraft(
+            hasAttachments: attachmentDraft.hasAttachments,
+            canSubmit: {
+                guard !viewModel.isStreaming else { return false }
+                guard !attachmentDraft.isImportingFiles else { return false }
+                guard attachmentDraft.images.isEmpty || supportsImageInput else {
+                    rejectImageInputForCurrentModel()
+                    return false
+                }
+                // Return reaches here even when the Send button is disabled —
+                // AppKit routes the key through ``ComposeTextEditor`` regardless
+                // of SwiftUI's button state. Previously that landed on a silent
+                // no-op: the keystroke did nothing and nothing said why.
+                //
+                // Two guarantees here. The draft is NOT cleared (it is still
+                // exactly what the user typed, ready to send the moment the
+                // model is up), and the attempt is acknowledged — the banner
+                // flashes and VoiceOver speaks the same sentence the Send
+                // tooltip carries.
+                guard acknowledgeIfNotReady() else { return false }
+                photoCapabilityNotice.dismiss()
+                return true
+            },
+            submit: { text in
+                let submission = attachmentDraft.takeSubmission()
+                composeFocusToken &+= 1
+                viewModel.send(
+                    text,
+                    alias: alias,
+                    supportsImageInput: supportsImageInput,
+                    imageAttachments: submission.images,
+                    fileAttachments: submission.files
+                )
+            }
         )
     }
 
@@ -2993,6 +3015,7 @@ struct ComposeTextEditor: NSViewRepresentable {
         view.onComposingChange = onComposingChange
         view.onPasteAttachments = onPasteAttachments
         view.onDropAttachments = onDropAttachments
+        context.coordinator.text = $text
         context.coordinator.onSubmit = onSubmit
         context.coordinator.onCancel = onCancel
         context.coordinator.onPasteAttachments = onPasteAttachments
@@ -3012,7 +3035,7 @@ struct ComposeTextEditor: NSViewRepresentable {
     }
 
     func makeCoordinator() -> Coordinator {
-        Coordinator(
+        let coordinator = Coordinator(
             text: $text,
             onSubmit: onSubmit,
             onCancel: onCancel,
@@ -3020,6 +3043,10 @@ struct ComposeTextEditor: NSViewRepresentable {
             isStreaming: isStreaming,
             onRecallLastUser: onRecallLastUser
         )
+        // A replacement editor must not replay an earlier Send/Cmd+L request
+        // over another field. Conversation changes request focus explicitly.
+        coordinator.lastFocusToken = focusToken
+        return coordinator
     }
 
     @MainActor
