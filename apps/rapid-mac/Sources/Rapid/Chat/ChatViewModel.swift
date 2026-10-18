@@ -2069,7 +2069,9 @@ final class ChatViewModel {
         proseContent: String,
         toolCalls: [ToolCall]?,
         finishReason: String?,
-        thinkingEnabled: Bool = false
+        thinkingEnabled: Bool = false,
+        completionTokens: Int? = nil,
+        maxTokens: Int? = nil
     ) -> String? {
         // Back-compat shim around the richer ``classifyTerminal``
         // helper. Callers that don't know about ``reasoningContent``
@@ -2081,7 +2083,9 @@ final class ChatViewModel {
             reasoningContent: "",
             toolCalls: toolCalls,
             finishReason: finishReason,
-            thinkingEnabled: thinkingEnabled
+            thinkingEnabled: thinkingEnabled,
+            completionTokens: completionTokens,
+            maxTokens: maxTokens
         )
         switch outcome {
         case .realCompletion, .reasoningOnlyTruncated:
@@ -2122,7 +2126,9 @@ final class ChatViewModel {
         reasoningContent: String,
         toolCalls: [ToolCall]?,
         finishReason: String?,
-        thinkingEnabled: Bool = false
+        thinkingEnabled: Bool = false,
+        completionTokens: Int? = nil,
+        maxTokens: Int? = nil
     ) -> TerminalOutcome {
         let proseEmpty = proseContent
             .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -2134,6 +2140,12 @@ final class ChatViewModel {
         let reasoningEmpty = reasoningContent
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .isEmpty
+        let stoppedUnderBudget: Bool
+        if let completionTokens, let maxTokens {
+            stoppedUnderBudget = completionTokens < maxTokens
+        } else {
+            stoppedUnderBudget = false
+        }
         // Cycle-2 F-002 fallback: the model burned its budget inside
         // the reasoning trace but produced *something* — the user
         // should see the (truncated) trace, not a red empty bubble.
@@ -2143,11 +2155,21 @@ final class ChatViewModel {
         // and the existing "switching models" copy is the right
         // pointer in that case.
         if finishReason == "length" && !reasoningEmpty {
+            if stoppedUnderBudget {
+                return .reasoningOnlyTruncated(
+                    hint: "The model stopped before writing an answer. Open the Reasoning section to see the partial trace, then try Regenerate."
+                )
+            }
             return .reasoningOnlyTruncated(
                 hint: "Hit the Max Tokens limit with the answer still inside the reasoning trace. Open the Reasoning section to see the partial trace, then raise Max Tokens (Settings → Sampling) or simplify the prompt to get a final answer."
             )
         }
         if finishReason == "length" {
+            if stoppedUnderBudget {
+                return .emptyTurnFailure(
+                    message: "The model stopped before writing an answer. Try Regenerate, or start a new session."
+                )
+            }
             // #161: hybrid models with thinking ON routinely burn
             // the entire 4 K default ``max_tokens`` budget inside
             // ``<think>...</think>`` on a 4 B / 9 B-class model and
@@ -3748,7 +3770,9 @@ Your previous draft refused the question by claiming you lack real-time access o
                         reasoningContent: current.reasoning,
                         toolCalls: current.toolCalls,
                         finishReason: reason,
-                        thinkingEnabled: request.enableThinking
+                        thinkingEnabled: request.enableThinking,
+                        completionTokens: capturedCompletionTokens,
+                        maxTokens: request.maxTokens
                     )
                     switch outcome {
                     case .realCompletion:
