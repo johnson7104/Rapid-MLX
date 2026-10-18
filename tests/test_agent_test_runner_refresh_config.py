@@ -22,6 +22,8 @@ import os
 from dataclasses import replace
 from unittest.mock import patch
 
+import pytest
+
 from rapid_mlx.agents.base import (
     AgentConfigSpec,
     AgentProfile,
@@ -148,8 +150,14 @@ def test_run_calls_setup_agent_config_before_tests():
     calls = []
 
     def _capture_setup(
-        profile_arg, base_url, model_id, agent_version=None, context_length=None
+        profile_arg,
+        base_url,
+        model_id,
+        agent_version=None,
+        context_length=None,
+        _probe_runner=None,
     ):
+        assert callable(_probe_runner)
         calls.append(
             {
                 "profile_name": profile_arg.name,
@@ -211,8 +219,14 @@ def test_run_refreshes_config_when_server_is_available():
     calls = []
 
     def _capture_setup(
-        profile_arg, base_url, model_id, agent_version=None, context_length=None
+        profile_arg,
+        base_url,
+        model_id,
+        agent_version=None,
+        context_length=None,
+        _probe_runner=None,
     ):
+        assert callable(_probe_runner)
         calls.append(model_id)
         return "ok"
 
@@ -309,6 +323,13 @@ def test_agent_without_home_env_still_uses_isolated_home(monkeypatch):
     """Every profile must avoid the operator's HOME, not only Codex/Hermes."""
     real_home = "/Users/operator"
     monkeypatch.setenv("HOME", real_home)
+    monkeypatch.setenv("CFFIXED_USER_HOME", real_home)
+    monkeypatch.setenv("BROWSER", "/usr/bin/open")
+    monkeypatch.setenv("ZDOTDIR", "/operator/zdotdir")
+    monkeypatch.setenv("BASH_ENV", "/operator/bash-env")
+    monkeypatch.setenv("ENV", "/operator/sh-env")
+    monkeypatch.setenv("PATH", "")
+    real_path = os.environ["PATH"]
     profile = _make_profile("opencode", "yaml")
     profile = replace(
         profile,
@@ -318,10 +339,24 @@ def test_agent_without_home_env_still_uses_isolated_home(monkeypatch):
 
     def _capture_setup(*_args, **_kwargs):
         observed["setup_home"] = os.environ["HOME"]
+        assert os.environ["CFFIXED_USER_HOME"] == os.environ["HOME"]
+        assert os.environ["BROWSER"] == os.path.join(
+            os.path.dirname(os.environ["_AGENT_TEST_GUI_MARKER"]), "browser"
+        )
+        assert not os.environ["BROWSER"].startswith(os.environ["HOME"])
+        assert os.environ["PATH"].split(os.pathsep)[1:] == os.defpath.split(os.pathsep)
         return "ok"
 
     def _capture_e2e(*_args, env_overrides=None, **_kwargs):
         observed["child_home"] = env_overrides["HOME"]
+        assert env_overrides["BROWSER"] == os.path.join(
+            os.path.dirname(env_overrides["_AGENT_TEST_GUI_MARKER"]), "browser"
+        )
+        assert not env_overrides["BROWSER"].startswith(env_overrides["HOME"])
+        assert env_overrides["PATH"].split(os.pathsep)[0] == os.path.dirname(
+            env_overrides["BROWSER"]
+        )
+        assert env_overrides["CFFIXED_USER_HOME"] == env_overrides["HOME"]
         return TestResult("e2e_chat", TestStatus.PASS)
 
     from rapid_mlx.agents.testing import TestResult, TestStatus
@@ -343,6 +378,271 @@ def test_agent_without_home_env_still_uses_isolated_home(monkeypatch):
     assert observed["setup_home"] == observed["child_home"]
     assert "rapid-mlx-opencode-home-" in observed["child_home"]
     assert os.environ["HOME"] == real_home
+    assert os.environ["CFFIXED_USER_HOME"] == real_home
+    assert os.environ["BROWSER"] == "/usr/bin/open"
+    assert os.environ["ZDOTDIR"] == "/operator/zdotdir"
+    assert os.environ["BASH_ENV"] == "/operator/bash-env"
+    assert os.environ["ENV"] == "/operator/sh-env"
+    assert os.environ["PATH"] == real_path
+    assert "_AGENT_TEST_GUI_MARKER" not in os.environ
+
+
+def test_config_refresh_launch_attempt_fails_before_e2e(monkeypatch):
+    import subprocess
+
+    profile = _make_profile("opencode", "yaml")
+    observed = []
+
+    def _setup(*_args, **_kwargs):
+        import shutil
+
+        shutil.rmtree(os.environ["HOME"])
+        observed.append(
+            subprocess.run(["open", "https://example.invalid"], check=False)
+        )
+
+    with (
+        patch.object(AgentTestRunner, "_server_available", return_value=True),
+        patch("rapid_mlx.agents.adapter.setup_agent_config", side_effect=_setup),
+        patch("rapid_mlx.agents.testing._test_plain_chat") as plain_chat,
+    ):
+        report = AgentTestRunner(profile, model_id="local-model").run()
+
+    assert observed[0].returncode == 126
+    assert report.results[0].status is TestStatus.FAIL
+    assert "sign in to" in report.results[0].message
+    plain_chat.assert_not_called()
+
+
+def test_config_refresh_replaces_home_then_login_shell_still_uses_guard():
+    import shutil
+    import subprocess
+    import sys
+
+    profile = replace(
+        _make_profile("opencode", "yaml"),
+        testing=AgentTestingSpec(binary="opencode", query_cmd="opencode {query}"),
+    )
+    seen = []
+
+    def _setup(*_args, **_kwargs):
+        home = os.environ["HOME"]
+        shutil.rmtree(home)
+        os.makedirs(home)
+        with open(os.path.join(home, ".profile"), "w", encoding="utf-8") as handle:
+            handle.write(
+                "export EARLY_OPEN=$(command -v open)\n"
+                "export REFRESHED_CONFIG=1\n"
+                "PATH=/usr/bin:/bin\n"
+                "export AFTER_RESET_OPEN=$(command -v open)\nreturn\n"
+            )
+        with open(os.path.join(home, ".zshrc"), "w", encoding="utf-8") as handle:
+            handle.write(
+                "export ZSH_EARLY_OPEN=$(command -v open)\n"
+                "export ZSH_REFRESHED_CONFIG=1\n"
+                "PATH=/usr/bin:/bin\n"
+                "export ZSH_AFTER_RESET_OPEN=$(command -v open)\nreturn\n"
+            )
+
+    def _e2e(*_args, env_overrides=None, **_kwargs):
+        env = os.environ | env_overrides
+        for shell in ("/bin/sh", "/bin/bash"):
+            result = subprocess.run(
+                [
+                    shell,
+                    "-lc",
+                    'command -v open; printf \'%s\\n%s\\n%s\\n%s\' "$EARLY_OPEN" "$AFTER_RESET_OPEN" "$REFRESHED_CONFIG" "$PATH"',
+                ],
+                env=env,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            seen.append(result.stdout)
+            lines = result.stdout.splitlines()
+            assert lines[:4] == ["open", "open", "open", "1"]
+            assert lines[4].split(os.pathsep)[0] == os.path.dirname(
+                env_overrides["BROWSER"]
+            )
+        if sys.platform == "darwin":
+            result = subprocess.run(
+                [
+                    "/bin/zsh",
+                    "-lic",
+                    'command -v open; printf "%s\\n%s\\n%s\\n%s" "$ZSH_EARLY_OPEN" "$ZSH_AFTER_RESET_OPEN" "$ZSH_REFRESHED_CONFIG" "$PATH"',
+                ],
+                env=env,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            seen.append(result.stdout)
+            lines = result.stdout.splitlines()
+            assert lines[:4] == ["open", "open", "open", "1"]
+            assert lines[4].split(os.pathsep)[0] == os.path.dirname(
+                env_overrides["BROWSER"]
+            )
+        return TestResult("e2e_chat", TestStatus.PASS)
+
+    from rapid_mlx.agents.testing import TestResult
+
+    with (
+        patch.object(AgentTestRunner, "_server_available", return_value=True),
+        patch.object(AgentTestRunner, "_agent_binary_available", return_value=True),
+        patch("rapid_mlx.agents.adapter.setup_agent_config", side_effect=_setup),
+        patch(
+            "rapid_mlx.agents.testing._test_plain_chat",
+            return_value=TestResult("plain_chat", TestStatus.PASS),
+        ),
+        patch("rapid_mlx.agents.testing._test_e2e_chat", side_effect=_e2e),
+    ):
+        AgentTestRunner(profile, model_id="local-model").run()
+
+    assert len(seen) == (3 if sys.platform == "darwin" else 2)
+
+
+def test_config_refresh_replaces_home_with_file_then_restores_directory():
+    import shutil
+    from pathlib import Path
+
+    from rapid_mlx.agents.testing import TestResult
+
+    profile = replace(
+        _make_profile("opencode", "yaml"),
+        needs_function_calling=False,
+        needs_streaming=False,
+    )
+    seen = {}
+
+    def _setup(*_args, **_kwargs):
+        home = Path(os.environ["HOME"])
+        shutil.rmtree(home)
+        home.write_text("replaced", encoding="utf-8")
+        seen["home"] = home
+
+    def _plain_chat(*_args, **_kwargs):
+        assert seen["home"].is_dir()
+        assert (seen["home"] / ".profile").is_file()
+        return TestResult("plain_chat", TestStatus.PASS)
+
+    with (
+        patch.object(AgentTestRunner, "_server_available", return_value=True),
+        patch.object(AgentTestRunner, "_agent_binary_available", return_value=False),
+        patch("rapid_mlx.agents.adapter.setup_agent_config", side_effect=_setup),
+        patch("rapid_mlx.agents.testing._test_plain_chat", side_effect=_plain_chat),
+    ):
+        report = AgentTestRunner(profile, model_id="local-model").run()
+
+    assert report.failed == 0
+
+
+def test_config_refresh_reports_failure_when_shell_guard_cannot_be_restored():
+    from rapid_mlx.agents import testing as testing_module
+
+    profile = _make_profile("opencode", "yaml")
+    install_guard = testing_module._install_shell_path_guard
+    installs = 0
+
+    def fail_restore(shim_dir, home):
+        nonlocal installs
+        installs += 1
+        if installs == 2:
+            raise OSError("profile write denied")
+        return install_guard(shim_dir, home)
+
+    with (
+        patch.object(AgentTestRunner, "_server_available", return_value=True),
+        patch("rapid_mlx.agents.adapter.setup_agent_config"),
+        patch.object(
+            testing_module, "_install_shell_path_guard", side_effect=fail_restore
+        ),
+        patch("rapid_mlx.agents.testing._test_plain_chat") as plain_chat,
+    ):
+        report = AgentTestRunner(profile, model_id="local-model").run()
+
+    assert installs == 2
+    assert report.results[0].name == "config_refresh"
+    assert report.results[0].status is TestStatus.FAIL
+    assert "profile write denied" in report.results[0].message
+    plain_chat.assert_not_called()
+
+
+@pytest.mark.parametrize("agent_name", ["hermes", "opencode"])
+def test_setup_probe_stops_delayed_descendant(tmp_path, agent_name):
+    import subprocess
+    import sys
+    import time
+
+    profile = _make_profile(agent_name, "yaml")
+    delayed = tmp_path / "delayed-setup-child-ran"
+    child_script = (
+        f"import pathlib, time; time.sleep(0.5); pathlib.Path({str(delayed)!r}).touch()"
+    )
+    setup_script = (
+        "import subprocess, sys; "
+        "subprocess.Popen([sys.executable, '-c', "
+        f"{child_script!r}], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)"
+    )
+
+    def _setup(*_args, _probe_runner=None, **_kwargs):
+        assert callable(_probe_runner)
+        result = _probe_runner(
+            [sys.executable, "-c", setup_script],
+            timeout=5,
+            capture_output=True,
+            text=True,
+            stdin=subprocess.DEVNULL,
+            check=agent_name == "opencode",
+        )
+        assert result.returncode == 0
+        return "ok"
+
+    from rapid_mlx.agents.testing import TestResult
+
+    with (
+        patch.object(AgentTestRunner, "_server_available", return_value=True),
+        patch.object(AgentTestRunner, "_agent_binary_available", return_value=False),
+        patch("rapid_mlx.agents.adapter.setup_agent_config", side_effect=_setup),
+        patch(
+            "rapid_mlx.agents.testing._test_plain_chat",
+            return_value=TestResult("plain_chat", TestStatus.PASS),
+        ),
+    ):
+        report = AgentTestRunner(profile, model_id="local-model").run()
+
+    assert report.results[0].status is TestStatus.PASS
+    time.sleep(0.7)
+    assert not delayed.exists()
+
+
+def test_late_setup_launch_marker_fails_final_report():
+    from pathlib import Path
+
+    from rapid_mlx.agents.testing import TestResult
+
+    profile = _make_profile("hermes", "yaml")
+    marker = None
+
+    def _setup(*_args, **_kwargs):
+        nonlocal marker
+        marker = Path(os.environ["_AGENT_TEST_GUI_MARKER"])
+        return "ok"
+
+    def _plain_chat(*_args, **_kwargs):
+        assert marker is not None
+        marker.touch()
+        return TestResult("plain_chat", TestStatus.PASS)
+
+    with (
+        patch.object(AgentTestRunner, "_server_available", return_value=True),
+        patch.object(AgentTestRunner, "_agent_binary_available", return_value=False),
+        patch("rapid_mlx.agents.adapter.setup_agent_config", side_effect=_setup),
+        patch("rapid_mlx.agents.testing._test_plain_chat", side_effect=_plain_chat),
+    ):
+        report = AgentTestRunner(profile, model_id="local-model").run()
+
+    assert report.results[-1].name == "gui_launch"
+    assert report.results[-1].status is TestStatus.FAIL
 
 
 def test_claude_e2e_sets_documented_config_directory():

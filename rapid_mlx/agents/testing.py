@@ -20,6 +20,7 @@ import os
 import re
 import shlex
 import shutil
+import signal
 import subprocess
 import tempfile
 import time
@@ -52,6 +53,9 @@ _ANTHROPIC_REMOTE_ENV = (
 # property of the string the subprocess boundary produced, not a guess made
 # from the child's own prose.
 _EXIT_ERR_PREFIX = "EXIT:"
+_GUI_LAUNCH_MARKER = ".gui-launch-attempted"
+_GUI_LAUNCH_MARKER_ENV = "_AGENT_TEST_GUI_MARKER"
+_GUI_LAUNCH_ERR_PREFIX = "GUI_LAUNCH:"
 
 # Diagnostics may contain normalized or derived request URLs, not just base_url.
 _DIAGNOSTIC_URL_RE = re.compile(r"https?://[^\s\"']+", re.IGNORECASE)
@@ -951,6 +955,126 @@ _XDG_BASE_DIRS: tuple[tuple[str, str], ...] = (
 )
 
 
+def _install_gui_launch_guard(guard_root: Path) -> Path:
+    """Refuse PATH launches and browser defaults under the disposable HOME.
+
+    An absolute /usr/bin/open or /usr/bin/osascript, an app executable, or a
+    native launch API bypasses PATH and BROWSER. These cannot be blocked by
+    environment shims; callers must not treat this as an OS sandbox.
+    """
+    shim_dir = guard_root / "bin"
+    shim_dir.mkdir()
+    marker = shim_dir / _GUI_LAUNCH_MARKER
+    script = (
+        "#!/bin/sh\n"
+        f": > {shlex.quote(str(marker))}\n"
+        'printf "%s\\n" "Browser and app launches are disabled during agents --test" >&2\n'
+    )
+    for name in ("open", "xdg-open", "osascript"):
+        shim = shim_dir / name
+        shim.write_text(script + "exit 126\n", encoding="utf-8")
+        shim.chmod(0o755)
+    # Python's webbrowser tries the next registered browser after a nonzero
+    # BROWSER exit; on macOS that reaches absolute /usr/bin/osascript. Report
+    # success to the library while the marker still makes agents --test fail.
+    browser = shim_dir / "browser"
+    browser.write_text(script + "exit 0\n", encoding="utf-8")
+    browser.chmod(0o755)
+    return browser
+
+
+def _install_shell_path_guard(shim_dir: Path, home: Path) -> dict[str, str]:
+    """Put the shim back first after macOS login shells run path_helper."""
+    path_script = shim_dir.parent / "shell-path.sh"
+    script = (
+        f'PATH={shlex.quote(str(shim_dir))}:"$PATH"\nexport PATH\n'
+        # A startup file may reset PATH before the wrapper's final restore.
+        # Shell functions and an alias keep bare launch commands guarded in
+        # that interval; absolute executables and native APIs remain outside
+        # the reach of an environment guard.
+        f'open() {{ {shlex.quote(str(shim_dir / "open"))} "$@"; }}\n'
+        f'osascript() {{ {shlex.quote(str(shim_dir / "osascript"))} "$@"; }}\n'
+        'if [ -n "${BASH_VERSION-}" ]; then shopt -s expand_aliases; fi\n'
+        f"alias xdg-open={shlex.quote(str(shim_dir / 'xdg-open'))}\n"
+    )
+    path_script.write_text(script, encoding="utf-8")
+    # Keep startup files in the disposable HOME. Redirecting ZDOTDIR to the
+    # guard directory would hide agent setup's .zshenv/.zshrc/.zlogin.
+    for name in (".profile", ".bash_profile", ".zshenv", ".zprofile", ".zlogin"):
+        profile = home / name
+        # Config refresh may create a symlink; never read through it.
+        if profile.is_symlink():
+            profile.unlink()
+        existing = profile.read_text(encoding="utf-8") if profile.exists() else ""
+        original = shim_dir.parent / f"original-{name[1:]}.sh"
+        if original.is_symlink():
+            original.unlink()
+        source_line = f". {shlex.quote(str(original))}\n"
+        wrapper = script + source_line + script
+        if existing == wrapper and original.exists():
+            continue
+        if existing == script:
+            continue
+        # Creating .bash_profile makes Bash skip .profile. Source it when the
+        # file is ours so config refresh's .profile exports remain visible.
+        if name == ".bash_profile" and not existing:
+            existing = '. "$HOME/.profile"\n'
+        # A return in sourced content returns to this wrapper, so the PATH
+        # restoration still runs before the agent command. exit/exec stop or
+        # replace the shell, leaving no subsequent command to launch a GUI.
+        # Unlink before writing: a startup file or saved original may be a
+        # hard link to a file outside the disposable HOME and guard directory.
+        profile.unlink(missing_ok=True)
+        if existing:
+            original.unlink(missing_ok=True)
+            original.write_text(existing, encoding="utf-8")
+            profile.write_text(wrapper, encoding="utf-8")
+        else:
+            profile.write_text(script, encoding="utf-8")
+    return {
+        "ZDOTDIR": str(home),
+        "BASH_ENV": str(path_script),
+        "ENV": str(path_script),
+    }
+
+
+def _run_guarded_agent(
+    cmd: list[str], *, timeout: int, cwd: str, env: dict[str, str]
+) -> subprocess.CompletedProcess[str]:
+    """Contain a test CLI's descendants until its launch guard is checked.
+
+    A CLI can exit after starting a background tool. Kill its process group
+    before the guard directory is removed, including on timeout. A child that
+    deliberately creates a new session can still escape this boundary.
+    """
+
+    with subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        stdin=subprocess.DEVNULL,
+        cwd=cwd,
+        env=env,
+        start_new_session=True,
+    ) as proc:
+
+        def stop_group() -> None:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+
+        try:
+            stdout, stderr = proc.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            stop_group()
+            raise
+        finally:
+            stop_group()
+    return subprocess.CompletedProcess(cmd, proc.returncode, stdout, stderr)
+
+
 def _agent_query(
     binary: str,
     query_cmd: str,
@@ -1002,6 +1126,32 @@ def _agent_query(
         for key in _ANTHROPIC_REMOTE_ENV:
             child_env.pop(key, None)
     child_env.update(env_overrides or {})
+    # Foundation ignores HOME when CFFIXED_USER_HOME is absent. An explicit
+    # child HOME must therefore pin both; otherwise leave the caller's value
+    # alone for ordinary, unguarded _agent_query users.
+    if env_overrides and "HOME" in env_overrides:
+        child_env["CFFIXED_USER_HOME"] = child_env["HOME"]
+    browser = (env_overrides or {}).get("BROWSER")
+    marker_path = (env_overrides or {}).get(_GUI_LAUNCH_MARKER_ENV)
+    launch_marker = (
+        Path(marker_path)
+        if browser
+        and marker_path
+        and Path(marker_path) == Path(browser).parent / _GUI_LAUNCH_MARKER
+        else None
+    )
+    if launch_marker is not None:
+        # This records accidental GUI launches by cooperative agents. A child
+        # able to run arbitrary code can delete its own marker; concealment is
+        # outside the guard's threat model.
+        # Never clear a prior attempt: a setup subprocess may reach its shim
+        # after setup's check but before this first agent probe.
+        if launch_marker.exists():
+            return None, (
+                f"{_GUI_LAUNCH_ERR_PREFIX} agent tried to open a browser or app — "
+                f"sign in to {Path(binary_path).name} normally first, "
+                "then re-run --test"
+            )
     # OpenHands 1.x resolves these explicit paths before HOME and cwd. An
     # inherited value would let an auto-approved test read the operator's
     # settings/MCP servers or run tools in their real workspace.
@@ -1046,30 +1196,49 @@ def _agent_query(
             )
 
     try:
-        proc = subprocess.run(
-            cmd_parts,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            # An explicit workspace, not the caller's cwd — see
-            # ``_e2e_workspace``. Falling back to os.getcwd() keeps any
-            # caller that hasn't opted in behaving exactly as before.
-            cwd=cwd or os.getcwd(),
-            # Close stdin. Without this the child inherits ours, and a CLI
-            # that reads stdin when it isn't a TTY blocks until `timeout`
-            # instead of answering the query it was handed on argv. Codex
-            # does exactly that — `codex exec '<query>'` prints "Reading
-            # additional input from stdin..." and then waits forever, so
-            # the e2e gate spent its whole budget on a process that never
-            # got a chance to fail. Every agent CLI runs headless here, so
-            # none of them has any business reading stdin (#1683).
-            stdin=subprocess.DEVNULL,
-            # Env-profile setup returns shell exports; it cannot mutate the
-            # parent process. Pass those values explicitly so an E2E agent
-            # never falls back to its normal remote provider or real key.
-            env=child_env,
+        # Guarded probes get their own process group. Otherwise a CLI could
+        # print an answer, exit, and leave a child waiting to call system open
+        # after the shims are cleaned up. Keep the original subprocess.run
+        # behavior for callers that did not opt into the GUI guard.
+        proc = (
+            _run_guarded_agent(
+                cmd_parts,
+                timeout=timeout,
+                cwd=cwd or os.getcwd(),
+                env=child_env,
+            )
+            if launch_marker is not None
+            else subprocess.run(
+                cmd_parts,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                # An explicit workspace, not the caller's cwd — see
+                # ``_e2e_workspace``. Falling back to os.getcwd() keeps any
+                # caller that hasn't opted in behaving exactly as before.
+                cwd=cwd or os.getcwd(),
+                # Close stdin. Without this the child inherits ours, and a CLI
+                # that reads stdin when it isn't a TTY blocks until `timeout`
+                # instead of answering the query it was handed on argv. Codex
+                # does exactly that — `codex exec '<query>'` prints "Reading
+                # additional input from stdin..." and then waits forever, so
+                # the e2e gate spent its whole budget on a process that never
+                # got a chance to fail. Every agent CLI runs headless here, so
+                # none of them has any business reading stdin (#1683).
+                stdin=subprocess.DEVNULL,
+                # Env-profile setup returns shell exports; it cannot mutate the
+                # parent process. Pass those values explicitly so an E2E agent
+                # never falls back to its normal remote provider or real key.
+                env=child_env,
+            )
         )
         output = proc.stdout + proc.stderr
+        if launch_marker is not None and launch_marker.exists():
+            return None, (
+                f"{_GUI_LAUNCH_ERR_PREFIX} agent tried to open a browser or app — "
+                f"sign in to {Path(binary_path).name} normally first, "
+                "then re-run --test"
+            )
         if "error" in output.lower() and "HTTP 4" in output:
             return None, "Agent error: server issue"
         # Harness self-refuses to initialize when the served model's
@@ -1158,6 +1327,13 @@ def _agent_query(
         # run itself has reported that it went wrong.
         return output, None
     except subprocess.TimeoutExpired as exc:
+        if launch_marker is not None and launch_marker.exists():
+            return None, (
+                f"{_GUI_LAUNCH_ERR_PREFIX} agent tried to open a browser or app — "
+                f"sign in to {Path(binary_path).name} normally first, "
+                "then re-run --test"
+            )
+
         # A headless agent can finish the capability under test, print the
         # evidence, and then fail to terminate its own loop.  Keep that output
         # so capability-specific probes can grade what actually happened and
@@ -1198,6 +1374,8 @@ def _err_to_status(err: str | None) -> TestStatus:
     """
     if not err:
         return TestStatus.PASS  # caller shouldn't pass empty err but stay safe
+    if err.startswith(_GUI_LAUNCH_ERR_PREFIX):
+        return TestStatus.FAIL
     if err.startswith(_EXIT_ERR_PREFIX):
         return TestStatus.ERROR
     if "not found" in err:
@@ -1571,6 +1749,20 @@ class AgentTestRunner:
         isolated_config_home = tempfile.TemporaryDirectory(
             prefix=f"rapid-mlx-{self.profile.name}-home-"
         )
+        isolated_root = Path(isolated_config_home.name)
+        # Keep the shims outside the agent's writable/configurable HOME so
+        # a config refresh that replaces HOME cannot remove the guard.
+        gui_guard_dir = tempfile.TemporaryDirectory(
+            prefix=f"rapid-mlx-{self.profile.name}-gui-"
+        )
+        browser_shim = _install_gui_launch_guard(Path(gui_guard_dir.name))
+        guard_env = {
+            "PATH": f"{browser_shim.parent}{os.pathsep}{os.environ.get('PATH') or os.defpath}",
+            "BROWSER": str(browser_shim),
+            _GUI_LAUNCH_MARKER_ENV: str(browser_shim.parent / _GUI_LAUNCH_MARKER),
+            "CFFIXED_USER_HOME": str(isolated_root),
+            **_install_shell_path_guard(browser_shim.parent, isolated_root),
+        }
         config_home_env = active_config.home_env
 
         # Refresh the agent's on-disk config (e.g. ``~/.hermes/config.yaml``)
@@ -1599,8 +1791,8 @@ class AgentTestRunner:
                 redirected["CLINE_PROVIDER_SETTINGS_PATH"] = str(
                     Path(isolated_config_home.name) / "settings" / "providers.json"
                 )
-            previous = {key: os.environ.get(key) for key in redirected}
-            os.environ.update(redirected)
+            previous = {key: os.environ.get(key) for key in (*redirected, *guard_env)}
+            os.environ.update(redirected | guard_env)
             try:
                 if self.profile.name == "cline":
                     from rapid_mlx.launch import cline
@@ -1619,12 +1811,30 @@ class AgentTestRunner:
                         api_key=os.environ.get("RAPID_MLX_API_KEY") or "sk-noop",
                     )
                 else:
+
+                    def guarded_probe(cmd: list[str], **kwargs):
+                        result = _run_guarded_agent(
+                            cmd,
+                            timeout=kwargs["timeout"],
+                            cwd=os.getcwd(),
+                            env=os.environ.copy(),
+                        )
+                        if kwargs.get("check"):
+                            result.check_returncode()
+                        return result
+
+                    probe_runner = (
+                        guarded_probe
+                        if self.profile.name in {"hermes", "opencode"}
+                        else None
+                    )
                     setup_agent_config(
                         self.profile,
                         base_url=self.base_url,
                         model_id=self.model_id,
                         agent_version=self.agent_version,
                         context_length=context_length,
+                        _probe_runner=probe_runner,
                     )
             finally:
                 for key, value in previous.items():
@@ -1638,6 +1848,42 @@ class AgentTestRunner:
                 self.profile.name,
                 self._redact(str(exc)),
             )
+        # A config refresh can replace the disposable HOME, including its
+        # login-shell startup files. Restore those files before agent probes.
+        try:
+            if isolated_root.is_symlink() or (
+                isolated_root.exists() and not isolated_root.is_dir()
+            ):
+                isolated_root.unlink()
+            isolated_root.mkdir(parents=True, exist_ok=True)
+            _install_shell_path_guard(browser_shim.parent, isolated_root)
+        except OSError as exc:
+            report.results.append(
+                TestResult(
+                    "config_refresh",
+                    TestStatus.FAIL,
+                    message=f"could not restore disposable agent HOME: {self._redact(str(exc))}",
+                )
+            )
+            with contextlib.suppress(OSError):
+                isolated_config_home.cleanup()
+            gui_guard_dir.cleanup()
+            return report
+        if (browser_shim.parent / _GUI_LAUNCH_MARKER).exists():
+            report.results.append(
+                TestResult(
+                    "config_refresh",
+                    TestStatus.FAIL,
+                    message=(
+                        "agent tried to open a browser or app — "
+                        f"sign in to {self.profile.display_name} normally first, "
+                        "then re-run --test"
+                    ),
+                )
+            )
+            isolated_config_home.cleanup()
+            gui_guard_dir.cleanup()
+            return report
 
         t0 = time.time()
         streaming = self.profile.get_streaming_for_version(self.agent_version)
@@ -1671,7 +1917,7 @@ class AgentTestRunner:
         # have the child read their REAL global config — plugins, remote
         # provider credentials — and write state outside the throwaway home.
         # Pin every XDG base directory to its default location inside it.
-        isolated_root = Path(isolated_config_home.name)
+        env_overrides.update(guard_env)
         for xdg_key, xdg_rel in _XDG_BASE_DIRS:
             env_overrides[xdg_key] = str(isolated_root / xdg_rel)
         if self.profile.name == "goose":
@@ -1837,8 +2083,24 @@ class AgentTestRunner:
         for result in report.results:
             result.name = self._redact(result.name)
             result.message = self._redact(result.message)
+        if (browser_shim.parent / _GUI_LAUNCH_MARKER).exists() and not any(
+            result.message.startswith(_GUI_LAUNCH_ERR_PREFIX)
+            for result in report.results
+        ):
+            report.results.append(
+                TestResult(
+                    "gui_launch",
+                    TestStatus.FAIL,
+                    message=(
+                        "agent tried to open a browser or app — "
+                        f"sign in to {self.profile.display_name} normally first, "
+                        "then re-run --test"
+                    ),
+                )
+            )
         if isolated_config_home is not None:
             isolated_config_home.cleanup()
+        gui_guard_dir.cleanup()
         return report
 
     def _run_specific_tests(self, test_module_name: str) -> list[TestResult]:
