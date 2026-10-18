@@ -30,7 +30,10 @@ struct ClockContextFramingTests {
         let trailer = try #require(stamped.wireSuffix)
         #expect(stamped.content == typed)
         #expect(stamped.modelContent == typed + "\n\n" + ChatViewModel.clockContext(at: row.createdAt, calendar: calendar))
-        #expect(trailer == "(Local time: Sunday, October 18, 2026 at 2:14 PM (PDT, America/Los_Angeles))")
+        #expect(trailer == "(Local time: Sunday, October 18, 2026 at 2:14 PM)")
+        #expect(!trailer.contains("PDT"))
+        #expect(!trailer.contains("PST"))
+        #expect(!trailer.contains("America/Los_Angeles"))
         #expect(!trailer.contains("[MESSAGE SENT]"))
         #expect(!trailer.lowercased().contains("sent"))
         #expect(!trailer.contains("\n"))
@@ -45,6 +48,7 @@ struct ClockContextFramingTests {
         ], at: instant)
         let system = try #require(rows.first)
         #expect(system.role == .system)
+        #expect(system.modelContent.contains("America/Los_Angeles"))
         #expect(system.modelContent == ChatViewModel.currentDateContext(now: instant, calendar: calendar))
         #expect(!system.modelContent.contains("(Local time:"))
         #expect(!system.modelContent.contains("(Current time:"))
@@ -107,6 +111,21 @@ struct ClockContextFramingTests {
         #expect(retried[2].wireSuffix == ChatViewModel.clockContext(at: newest, calendar: calendar) + extra)
         #expect(retried[2].modelContent == baseline[2].modelContent + extra)
         #expect(retried.map(\.content) == rows.map(\.content))
+    }
+
+    @Test("Retry appends current time during the repeated daylight-saving fall-back hour")
+    func retryDuringRepeatedHour() {
+        let formatter = ISO8601DateFormatter()
+        let asked = formatter.date(from: "2026-11-01T08:30:00Z")!
+        let answeringAt = formatter.date(from: "2026-11-01T09:30:00Z")!
+        #expect(ChatViewModel.clockStampText(at: asked, calendar: calendar)
+            == ChatViewModel.clockStampText(at: answeringAt, calendar: calendar))
+
+        let line = ChatViewModel.answeringNowLine(
+            asked: asked, answeringAt: answeringAt, calendar: calendar
+        )
+        #expect(!line.isEmpty)
+        #expect(line == "\n(Current time: Sunday, November 1, 2026 at 1:30 AM)")
     }
 
     @Test("Clock annotation follows attachment extracts without changing their bytes")

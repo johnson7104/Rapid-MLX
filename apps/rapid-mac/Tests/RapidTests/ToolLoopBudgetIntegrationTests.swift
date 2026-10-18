@@ -67,6 +67,47 @@ struct ToolLoopBudgetIntegrationTests {
         #expect(toolRows.count == 5)
         #expect(toolRows.filter { $0.content.contains("budget exhausted") }.count == 2)
     }
+    @Test("A plain request omits the reader and unsolicited document calls are refused")
+    func noFileOmitsAndRefusesDocumentReader() async throws {
+        // Keep another tool offered so the loop reaches normal dispatch. The
+        // fake emits read_document on round one regardless of its omission.
+        ToolLoopBudgetProtocol.reset(documentReads: 1)
+        let registry = CountingToolRegistry(
+            toolName: "read_document", additionalToolNames: ["lookup"]
+        )
+        let model = ChatViewModel(
+            client: ChatStreamClient(
+                baseURL: URL(string: "fake://tool-loop")!,
+                session: ToolLoopBudgetProtocol.session()
+            ),
+            tools: registry,
+            persistsConversations: false
+        )
+        model.send("Write a story", alias: "test-model")
+        for _ in 0..<200 where model.isStreaming {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        #expect(!model.isStreaming)
+        #expect(ToolLoopBudgetProtocol.requestBodies.count == 2)
+        let body = try #require(ToolLoopBudgetProtocol.requestBodies.first)
+        let json = try #require(JSONSerialization.jsonObject(with: body) as? [String: Any])
+        let tools = try #require(json["tools"] as? [[String: Any]])
+        let toolNames = tools.compactMap { ($0["function"] as? [String: Any])?["name"] as? String }
+        #expect(toolNames.contains("lookup"))
+        #expect(!toolNames.contains("read_document"))
+        #expect(registry.runCount == 0)
+        let toolRows = model.messages.filter { $0.role == .tool }
+        #expect(toolRows.count == 1)
+        let refusal = try #require(toolRows.first)
+        #expect(refusal.toolCallID == "call_1")
+        #expect(refusal.status == .failed)
+        #expect(refusal.content.contains("read_document"))
+        #expect(refusal.content.contains("isn't available in this conversation"))
+        #expect(model.messages.last?.content == "Here is the answer from the evidence.")
+        #expect(model.messages.last?.status == .complete)
+        #expect(model.lastError == nil)
+    }
+
     @Test("read_document draws on its own budget instead of the general three")
     func documentReadsDoNotSpendTheGeneralBudget() async throws {
         // Paging a long attachment is inherently multi-call. If those calls
@@ -84,7 +125,11 @@ struct ToolLoopBudgetIntegrationTests {
             persistsConversations: false
         )
 
-        model.send("Summarize the attached report", alias: "test-model")
+        let attachment = try ChatFileAttachment(
+            filename: "report.txt", kind: .txt,
+            extractedText: "Report contents", sourceByteCount: 15
+        )
+        model.send("Summarize the attached report", alias: "test-model", fileAttachments: [attachment])
         for _ in 0..<200 where model.isStreaming {
             try await Task.sleep(for: .milliseconds(10))
         }
@@ -114,7 +159,11 @@ struct ToolLoopBudgetIntegrationTests {
             persistsConversations: false
         )
 
-        model.send("Read the whole thing", alias: "test-model")
+        let attachment = try ChatFileAttachment(
+            filename: "report.txt", kind: .txt,
+            extractedText: "Report contents", sourceByteCount: 15
+        )
+        model.send("Read the whole thing", alias: "test-model", fileAttachments: [attachment])
         for _ in 0..<400 where model.isStreaming {
             try await Task.sleep(for: .milliseconds(10))
         }
@@ -140,20 +189,20 @@ struct ToolLoopBudgetIntegrationTests {
 @MainActor
 private final class CountingToolRegistry: ToolRegistry {
     private(set) var runCount = 0
-    private let toolName: String
+    private let toolNames: [String]
 
-    init(toolName: String = "lookup") {
-        self.toolName = toolName
+    init(toolName: String = "lookup", additionalToolNames: [String] = []) {
+        self.toolNames = [toolName] + additionalToolNames
     }
 
     var definitions: [ToolDefinition] {
-        [
+        toolNames.map { toolName in
             ToolDefinition(
                 name: toolName,
                 description: "Look up evidence",
                 parameters: .object(["type": .string("object")])
             )
-        ]
+        }
     }
 
     func run(_ call: ToolCall) async -> ToolCallResult {
