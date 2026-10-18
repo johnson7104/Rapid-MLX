@@ -3592,7 +3592,7 @@ def _parse_tool_calls_with_parser(
 ) -> tuple[str, list | None]:
     """Parse tool calls, then honor ``tool_choice="none"`` by dropping them.
 
-    The parser still RUNS under ``"none"`` — that is what strips the wire
+    With tools declared, the parser still RUNS under ``"none"`` to strip the wire
     markup out of ``content`` (the R12 sanitizer invariant: raw
     ``<tool_call>…</tool_call>`` / ``[name({…})]`` must never leak to the
     client). What ``"none"`` forbids is *surfacing a call*: the OpenAI
@@ -3651,6 +3651,10 @@ def _run_tool_parser(
     """
     cfg = get_config()
     request_dict = request.model_dump() if hasattr(request, "model_dump") else request
+    # Match streaming: unknown/empty tools leave text untouched, including request=None.
+    if not request_dict or not request_dict.get("tools"):
+        return output_text or "", None
+
     declared: set[str] | None = None
     if cfg.tool_call_parser == "qwen3_coder_xml":
         declared = _request_declared_tool_names(request_dict)

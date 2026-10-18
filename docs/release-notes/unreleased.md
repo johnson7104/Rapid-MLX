@@ -5,6 +5,8 @@
 
 ## Highlights
 
+- **Consistent replies without tools**: buffered replies preserve model-emitted tool-call markup as text when no tools were offered, matching streaming replies. Fixes #4877.
+
 - **Cleaner Desktop answers after tool use**: chats that reach their tool budget now send the final-answer instruction as the last message, and show an answer or a clear fallback instead of raw tool-call markup. Fixes #4871.
 - **Start & Send**: when the chosen chat model is downloaded but stopped, Send starts it and sends the draft once it is ready; the draft stays put if startup is cancelled or fails. Fixes #4854.
 - **Desktop current-info answers recover more often**: chat retries an unreadable tool request once, then explains when live information could not be checked. Weather lookup also retries unresolved simplified Chinese place names in traditional script.
