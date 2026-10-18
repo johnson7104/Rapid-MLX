@@ -2629,6 +2629,11 @@ final class ChatViewModel {
         // tools-disabled correction round carrying ``groundingCorrectionPreamble``.
         var groundingCorrectionUsed = false
         var forceGroundingCorrection = false
+        // A malformed model-emitted call is resampled once. If it repeats,
+        // finish with a tools-disabled answer that states the uncertainty.
+        var unreadableToolRequestCount = 0
+        var emptyEarlyToolRetryUsed = false
+        var retryingEarlyEmptyToolRequest = false
         // The confabulated draft we are replacing, kept until the correction
         // round produces a usable answer. Restored if the retry stream fails,
         // is cancelled, or comes back empty — a wrong-but-present answer beats
@@ -2746,7 +2751,8 @@ final class ChatViewModel {
             // evidence, without stamping it or changing the newest real user.
             // A tool-free chat also runs as a "final" round; only a request
             // that ends on tool evidence is a real synthesis round.
-            let synthesizesToolEvidence = isFinalSynthesisRound && history.last?.role == .tool
+            let synthesizesToolEvidence =
+                isFinalSynthesisRound && history.last?.role == .tool
             if synthesizesToolEvidence {
                 history = ChatViewModel.addingToolBudgetSynthesisPreamble(to: history)
             }
@@ -2764,6 +2770,8 @@ final class ChatViewModel {
             let wireCarriesAttachmentGrounding =
                 ChatViewModel.historyCarriesAttachmentGrounding(history)
             let request: ChatStreamClient.Request
+            let isEarlyEmptyRetryRound = retryingEarlyEmptyToolRequest
+            retryingEarlyEmptyToolRequest = false
             if let s = sampling {
                 let resolved = s.resolved(toolsEnabled: !definitions.isEmpty)
                 request = ChatStreamClient.Request(
@@ -2771,7 +2779,8 @@ final class ChatViewModel {
                     messages: history,
                     temperature: resolved.temperature,
                     topP: resolved.topP,
-                    maxTokens: resolved.maxTokens,
+                    maxTokens: isEarlyEmptyRetryRound
+                        ? min(resolved.maxTokens, 2048) : resolved.maxTokens,
                     repetitionPenalty: resolved.repetitionPenalty,
                     repetitionPenaltyIsImplicitDefault:
                         resolved.repetitionPenaltyIsImplicitDefault,
@@ -2783,6 +2792,7 @@ final class ChatViewModel {
                 request = ChatStreamClient.Request(
                     alias: wireAlias,
                     messages: history,
+                    maxTokens: isEarlyEmptyRetryRound ? 2048 : 4096,
                     tools: definitions.isEmpty ? nil : definitions,
                     enableThinking: false,
                     supportsImageInput: supportsImageInput
@@ -2801,12 +2811,73 @@ final class ChatViewModel {
             )
             switch outcome {
             case .terminal:
-                // Tools-disabled rounds can still leak calls as plain text.
-                // Handle them before refusal detection; a correction containing
-                // only a call is restored from its draft below instead.
-                // Prose above a trailing call wins over the whole-content
-                // check: both detectors can match the same reply, and the
-                // answer must survive. A Stop keeps the cancellation result.
+                if isEarlyEmptyRetryRound,
+                   epoch == conversationEpoch,
+                   !Task.isCancelled,
+                   let retry = currentMessage(index: currentPlaceholder),
+                   retry.status == .failed,
+                   retry.content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                   retry.errorMessage.map({ error in
+                       error.hasPrefix("The model stopped before writing an answer.")
+                           || error.hasPrefix("Hit the Max Tokens limit before any output.")
+                           || error.hasPrefix("The model returned no text.")
+                   }) == true
+                {
+                    finishUnreadableToolFallback(at: currentPlaceholder, epoch: epoch)
+                    return
+                }
+                // The server may stop a looping sample before the token
+                // limit with no visible output. One fresh sample can recover
+                // the current-info turn without hiding a real budget limit.
+                if epoch == conversationEpoch,
+                   !Task.isCancelled,
+                   !definitions.isEmpty,
+                   let empty = currentMessage(index: currentPlaceholder),
+                   empty.status == .failed,
+                   empty.content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                   empty.errorMessage?.hasPrefix("The model stopped before writing an answer.") == true
+                {
+                    if emptyEarlyToolRetryUsed {
+                        finishUnreadableToolFallback(at: currentPlaceholder, epoch: epoch)
+                        return
+                    }
+                    emptyEarlyToolRetryUsed = true
+                    retryingEarlyEmptyToolRequest = true
+                    prepareUnreadableToolRetry(at: currentPlaceholder, epoch: epoch)
+                    continue
+                }
+                // The engine returned tool-shaped content but no structured
+                // call. A fresh sample can recover a transient malformed
+                // request; a second miss gets one tools-disabled answer so
+                // the user is told what information could not be fetched.
+                if epoch == conversationEpoch,
+                   !Task.isCancelled,
+                   currentMessage(index: currentPlaceholder)?.toolCallArtifactSuppressed == true,
+                   let leaked = currentMessage(index: currentPlaceholder)?.content,
+                   ChatMessage.proseAboveSuppressedToolCallArtifact(content: leaked) == nil
+                {
+                    unreadableToolRequestCount += 1
+                    if unreadableToolRequestCount > 1 {
+                        finishUnreadableToolFallback(at: currentPlaceholder, epoch: epoch)
+                        return
+                    }
+                    prepareUnreadableToolRetry(at: currentPlaceholder, epoch: epoch)
+                    continue
+                }
+                if unreadableToolRequestCount > 0,
+                    epoch == conversationEpoch,
+                    !Task.isCancelled,
+                    !ChatViewModel.carriesSuccessfulToolResultForThisTurn(
+                        Array(messages.prefix(currentPlaceholder))
+                    )
+                {
+                    // A retry that produces fluent prose still has no live
+                    // evidence. Do not show a guessed weather value.
+                    finishUnreadableToolFallback(at: currentPlaceholder, epoch: epoch)
+                    return
+                }
+                // A final tool-budget synthesis may still emit raw call syntax.
+                // Preserve any prose above it, or show the bounded failure.
                 if synthesizesToolEvidence,
                     epoch == conversationEpoch,
                     !Task.isCancelled,
@@ -3033,13 +3104,64 @@ final class ChatViewModel {
         "The model could not finish after \(cap) tool calls. Try rephrasing, or turn a tool off."
     }
 
+    nonisolated static let unreadableToolFallbackCopy =
+        "I couldn't retrieve or verify the information needed for a reliable answer. Try again or choose another model."
+    nonisolated static let unreadableToolFallbackChineseCopy =
+        "我无法获取或核实可靠的实时信息。请重试，或换一个模型。"
+
+    nonisolated static func unreadableToolFallbackCopy(for prompt: String) -> String {
+        var han = 0
+        var latin = 0
+        var kana = 0
+        for scalar in prompt.unicodeScalars {
+            switch scalar.value {
+            case 0x3400...0x4DBF, 0x4E00...0x9FFF: han += 1
+            case 0x0041...0x005A, 0x0061...0x007A: latin += 1
+            case 0x3040...0x30FF: kana += 1
+            default: break
+            }
+        }
+        return han > latin && kana == 0
+            ? unreadableToolFallbackChineseCopy : unreadableToolFallbackCopy
+    }
+
+    private func prepareUnreadableToolRetry(at index: Int, epoch: Int) {
+        guard epoch == conversationEpoch, var message = currentMessage(index: index) else { return }
+        message.content = ""
+        message.reasoning = ""
+        message.toolCalls = nil
+        message.stats = nil
+        message.contentTruncated = false
+        message.reasoningTruncated = false
+        message.toolCallArtifactSuppressed = false
+        message.toolNotCalledFlagged = false
+        message.status = .streaming
+        message.errorMessage = nil
+        message.failureKind = nil
+        updateMessage(at: index, with: message)
+    }
+
+    private func finishUnreadableToolFallback(at index: Int, epoch: Int) {
+        guard epoch == conversationEpoch, var message = currentMessage(index: index) else { return }
+        let prompt = messages.prefix(index).last(where: { $0.role == .user })?.content ?? ""
+        message.content = Self.unreadableToolFallbackCopy(for: prompt)
+        message.reasoning = ""
+        message.toolCalls = nil
+        message.stats = nil
+        message.contentTruncated = false
+        message.reasoningTruncated = false
+        message.toolCallArtifactSuppressed = false
+        message.toolNotCalledFlagged = false
+        message.status = .complete
+        message.errorMessage = nil
+        message.failureKind = nil
+        updateMessage(at: index, with: message)
+    }
+
     /// Append a wire-only user instruction after the final tool result.
-    /// In captured synthesis requests, a system-row instruction still produced
-    /// raw calls in 5/5 trials; the same text as a trailing user row produced
-    /// real answers in 5/5. Append after clock/guidance stamping so it stays bare.
-    /// Only a request that ends on a tool result gets it: a turn that offered
-    /// no tools at all also runs as a "final" round, and there the user's own
-    /// message must stay last (it also anchors attachment selection).
+    /// A trailing user instruction proved more reliable than a system-row
+    /// instruction during tool-budget synthesis. Tool-free requests keep
+    /// the real user message last for attachment selection.
     nonisolated static func addingToolBudgetSynthesisPreamble(
         to messages: [ChatMessage]
     ) -> [ChatMessage] {
