@@ -484,6 +484,31 @@ def test_v41_model_identity_includes_the_measured_sidecar(tmp_path: Path) -> Non
     ContractValidator().validate_model_identity(combined)
 
 
+def test_v41_colocated_sidecar_reads_the_draft_dir_at_its_revision(
+    tmp_path: Path,
+) -> None:
+    import json
+
+    from rapid_mlx.community_bench.run_builder import unresolved_model_identity
+    from rapid_mlx.models.deepseek_v41_native import artifacts
+
+    # The loader hands back the draft directory itself:
+    # .../snapshots/<sha>/dspark. The subfolder is source metadata only.
+    revision = "c" * 40
+    draft = tmp_path / "snapshots" / revision / "dspark"
+    draft.mkdir(parents=True)
+    (draft / "config.json").write_text(json.dumps({"model_type": "dspark"}))
+    primary = unresolved_model_identity(
+        artifacts.FLASH_1017.target_repo, "text_generation"
+    )
+    sidecar = local_runner._with_v41_sidecar_identity(
+        primary, str(draft), artifacts.FLASH_1017.target_repo
+    )["components"][1]
+
+    assert sidecar["source"]["subfolder"] == "dspark"
+    assert sidecar["source"]["resolved_revision"] == revision
+
+
 def test_v41_speculative_provenance_is_target_specific() -> None:
     from rapid_mlx.models.deepseek_v41_native import artifacts
 
@@ -662,6 +687,77 @@ def test_text_lane_uses_pinned_v41_serial_runtime(
     assert identity_calls[0][1]["snapshot_path"] == str(target_path)
     assert identity_calls[1][0][0] == artifacts.MTP_REPO
     assert identity_calls[1][1]["snapshot_path"] == str(mtp_path)
+
+
+def test_text_lane_resolves_pinned_mixed_precision_product(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from rapid_mlx.community_bench import runner, workspace
+    from rapid_mlx.models.deepseek_v41_native import artifacts
+
+    product = artifacts.FLASH_1017
+    target_path = tmp_path / "target"
+    target_path.mkdir()
+    calls: dict[str, object] = {}
+    tokenizer = object()
+    model = SimpleNamespace(args=SimpleNamespace(max_position_embeddings=1_048_576))
+
+    monkeypatch.setattr(
+        workspace, "benchmark_runtime_readiness", lambda *_args: {"status": "ready"}
+    )
+    monkeypatch.setattr(
+        artifacts, "require_product_memory", lambda a: calls.setdefault("memory", a)
+    )
+
+    def resolve(artifact, *, allow_local=True):
+        calls["resolve"] = (artifact, allow_local)
+        return target_path, target_path / "dspark"
+
+    monkeypatch.setattr(artifacts, "resolve_product_paths", resolve)
+
+    def load(target, mtp, **kwargs):
+        calls["load"] = (target, mtp, kwargs)
+        return model, tokenizer, object()
+
+    async def standardized(engine, active_tokenizer, **kwargs):
+        return _bench_result()
+
+    monkeypatch.setattr(local_runner, "_deepseek_v41_load_product_runtime", load)
+    monkeypatch.setattr(local_runner, "_deepseek_v41_input_limit", lambda: 8192)
+    monkeypatch.setattr(runner, "run_standardized_bench", standardized)
+    monkeypatch.setattr(
+        local_runner,
+        "unresolved_model_identity",
+        lambda *args, **kwargs: {
+            "schema_version": 1,
+            "identity_strength": "unresolved",
+            "pipeline_kind": "text_generation",
+            "components": [
+                {
+                    "component_id": "primary",
+                    "role": "primary",
+                    "source": {"kind": "huggingface", "repo_id": args[0]},
+                    "artifact": {"format": "mlx-safetensors"},
+                    "quantization": {"kind": "unknown", "base_dtype": "unknown"},
+                }
+            ],
+        },
+    )
+
+    asyncio.run(local_runner._text_measurements(product.alias, product.target_repo))
+
+    assert calls["memory"] == product
+    assert calls["resolve"] == (product, False)
+    assert calls["load"] == (
+        str(target_path),
+        str(target_path / "dspark"),
+        {
+            "target_revision": product.target_revision,
+            "mtp_revision": product.mtp_revision,
+            "mtp_identity": product.mtp_repo,
+            "mixed_target_precision": True,
+        },
+    )
 
 
 def test_text_lane_uses_serving_runtime_and_tolerates_shutdown_error(
