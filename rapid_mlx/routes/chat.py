@@ -7819,12 +7819,26 @@ async def stream_chat_completion(
             _output_logprobs_pending = want_logprobs and not _defer_logprobs
             for event in _chunk_events:
                 if event.type == "content":
-                    _event_logprobs = (
-                        _with_held_logprobs(_build_chunk_logprobs(output))
-                        if _output_logprobs_pending
-                        else None
-                    )
-                    _output_logprobs_pending = False
+                    if (
+                        event.released_held
+                        and not _defer_logprobs
+                        and processor.content_consumed == _consumed_before
+                    ):
+                        # #4957: text released ahead of a structured tool
+                        # call carries only the held tokens' logprobs unless
+                        # this output's own text is part of it. (Deferral
+                        # needs this output to have fed the hold-back, so
+                        # it never applies here; the guard keeps it explicit.)
+                        _event_logprobs = (
+                            _with_held_logprobs(None) if want_logprobs else None
+                        )
+                    else:
+                        _event_logprobs = (
+                            _with_held_logprobs(_build_chunk_logprobs(output))
+                            if _output_logprobs_pending
+                            else None
+                        )
+                        _output_logprobs_pending = False
                     if _buffer_forced_content:
                         if _forced_wire_quarantine:
                             # A channel boundary bisected marker-shaped content.
