@@ -150,17 +150,32 @@ async def _warm(engine, body: PrefillRequest) -> dict:
         temperature=0,
         enable_thinking=thinking,
     )
-    last = None
+
+    async def _consume():
+        last = None
+        try:
+            async for output in stream:
+                last = output
+                if output.finished:
+                    break
+        finally:
+            await stream.aclose()
+        return last
+
+    consume = asyncio.create_task(_consume())
     try:
-        async for output in stream:
-            last = output
-            if output.finished:
-                break
-    finally:
-        await stream.aclose()
-    current = asyncio.current_task()
-    if current is not None and cast(Any, current).cancelling():
-        raise asyncio.CancelledError()
+        # Waiting does not propagate the stream's outcome, so cancellation
+        # here always belongs to this warm task, even on Python 3.10.
+        await asyncio.wait({consume})
+    except asyncio.CancelledError:
+        consume.cancel()
+        while not consume.done():
+            try:
+                await asyncio.wait({consume})
+            except asyncio.CancelledError:
+                continue
+        raise
+    last = consume.result()
     if last is None or not last.finished:
         raise HTTPException(status_code=503, detail="Prefill did not complete")
     result = {
@@ -264,14 +279,17 @@ async def prefill(body: PrefillRequest, request: Request):
             previous = _active
             previous.cancel()
             try:
-                await previous
+                await asyncio.wait({previous})
             except asyncio.CancelledError:
-                pass
-            # A predecessor may suppress cancellation and return normally.
-            # Do not admit the replacement if its handler was cancelled.
-            current = asyncio.current_task()
-            if current is not None and cast(Any, current).cancelling():
-                raise asyncio.CancelledError()
+                previous.cancel()
+                while not previous.done():
+                    try:
+                        await asyncio.wait({previous})
+                    except asyncio.CancelledError:
+                        continue
+                raise
+            if not previous.cancelled():
+                previous.result()
         task = asyncio.create_task(_warm(cfg.engine, body))
         _active = task
         _active_key = body.draft_key
