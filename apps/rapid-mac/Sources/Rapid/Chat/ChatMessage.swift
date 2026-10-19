@@ -2199,11 +2199,12 @@ struct ChatMessage: Identifiable, Codable, Equatable, Hashable {
     /// "temperature" does not fire on "temperatures"' neighbours and
     /// "current" does not fire on "concurrent".
     static func promptAsksForLiveData(_ prompt: String) -> Bool {
-        let lowered = prompt.lowercased()
+        let lowered = prompt.lowercased().replacingOccurrences(of: "’", with: "'")
+        // Bare "current" is deliberately not a live cue (only "current price"/"current weather"), so "the current time/date" uses injected context.
         let liveKeywords: [String] = [
             "google for",
             "latest news", "latest version", "news about",
-            "today's", "this week's", "right now",
+            "this week's",
             "current price", "stock price", "exchange rate",
             "current weather",
             // Looser than the phrases above, and deliberately so: a
@@ -2212,7 +2213,47 @@ struct ChatMessage: Identifiable, Codable, Equatable, Hashable {
             "weather", "temperature", "forecast"
         ]
         for kw in liveKeywords where containsKeyword(kw, in: lowered) { return true }
-        return false
+        let hasClockCue = ["today's", "right now"].contains { containsKeyword($0, in: lowered) }
+        return hasClockCue && !promptOnlyAsksForDateOrTime(lowered)
+    }
+
+    /// A pure date, weekday, or clock-time request can use the local date/time
+    /// context injected by ChatViewModel.currentDateContext and clockContext.
+    /// After dropping filler, date/time words, and numbers, any remaining content
+    /// word (news, price, game, weather, portfolio, yield, headlines, Tokyo, etc.)
+    /// means the cue modifies a live subject, so the live-data caution stays.
+    private static func promptOnlyAsksForDateOrTime(_ prompt: String) -> Bool {
+        guard ["date", "day", "weekday", "time", "clock"].contains(where: {
+            containsKeyword($0, in: prompt)
+        }) else { return false }
+        let fillerWords: Set<String> = [
+            "i", "me", "my", "mine", "myself", "you", "your", "yours", "yourself",
+            "we", "us", "our", "ours", "ourselves", "he", "him", "his", "himself",
+            "she", "her", "hers", "herself", "they", "them", "their", "theirs",
+            "themselves", "it", "its", "itself", "this", "that", "these", "those",
+            "do", "does", "did", "be", "am", "is", "are", "was", "were", "been",
+            "being", "have", "has", "had", "can", "could", "may", "might", "must",
+            "shall", "should", "will", "would", "s", "d", "m", "re", "ve", "ll", "t",
+            "a", "an", "the", "of", "to", "in", "for", "on", "at", "by", "with",
+            "from", "about", "as", "and", "or", "but", "if", "so", "then", "than",
+            "what", "which", "when", "where", "who", "whom", "whose", "why", "how",
+            "please", "thanks", "thank", "hey", "hi", "hello", "kindly",
+            "tell", "give", "show", "know", "like", "find", "out", "get", "check",
+            "see", "say", "let", "ask", "here", "there",
+        ]
+        let dateTimeWords: Set<String> = [
+            "date", "day", "weekday", "time", "clock", "today", "now", "right",
+            "current", "local", "week", "month", "year", "hour", "hours",
+            "minute", "minutes", "timezone", "zone", "format", "formatted",
+            "iso", "mm", "dd", "yy", "yyyy", "utc", "gmt", "military", "standard",
+            "exactly", "number", "numbers", "monday", "tuesday", "wednesday",
+            "thursday", "friday", "saturday", "sunday",
+        ]
+        let words = prompt.split { !$0.isLetter && !$0.isNumber }
+        return words.allSatisfy {
+            fillerWords.contains(String($0)) || dateTimeWords.contains(String($0))
+                || $0.utf8.allSatisfy { $0 >= 48 && $0 <= 57 }
+        }
     }
 
     /// True when `prompt` carries arithmetic that stands on its own — a
