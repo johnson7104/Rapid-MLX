@@ -19,7 +19,7 @@ from typing import TYPE_CHECKING
 from unittest.mock import Mock
 
 from ..api.tool_calling import parse_tool_calls
-from ..api.utils import sanitize_output, strip_special_tokens
+from ..api.utils import StreamingContentSanitizer, sanitize_output, strip_special_tokens
 from ..domain.events import StreamEvent
 from ..tool_call_authorization import call_name, declared_names, log_drop
 
@@ -434,6 +434,8 @@ class StreamingPostProcessor:
 
         # State
         self.accumulated_text = ""
+        self._content_sanitizer = StreamingContentSanitizer()
+        self._content_sanitizer_accumulates = False
         self.tool_accumulated_text = ""
         # Accumulated reasoning content (split out by the reasoning parser
         # from the raw model output). Surfaced on the streaming Usage
@@ -2480,6 +2482,8 @@ class StreamingPostProcessor:
         because that would clear another active stream's parser state.
         """
         self.accumulated_text = ""
+        self._content_sanitizer = StreamingContentSanitizer()
+        self._content_sanitizer_accumulates = False
         self.tool_accumulated_text = ""
         self.accumulated_reasoning = ""
         self.tool_calls_detected = False
@@ -2605,6 +2609,36 @@ class StreamingPostProcessor:
 
         Returns a list of StreamEvents (may be empty if content is suppressed).
         """
+        events = self._process_chunk_events(output)
+        if any(event.type == "tool_call" for event in events):
+            tail = self._content_sanitizer.flush()
+            if self._content_sanitizer_accumulates:
+                self.accumulated_text += tail
+            self._insert_content_before_tool_call(events, tail)
+        return events
+
+    @staticmethod
+    def _insert_content_before_tool_call(events: list[StreamEvent], content: str):
+        """Keep resolved content ahead of the next structured call, or at EOF."""
+        if content:
+            index = next(
+                (i for i, event in enumerate(events) if event.type == "tool_call"),
+                len(events),
+            )
+            events.insert(index, StreamEvent(type="content", content=content))
+
+    @property
+    def content_held(self) -> bool:
+        """Whether streamed content text is held back pending later deltas."""
+        return self._content_sanitizer.holding
+
+    @property
+    def content_consumed(self) -> int:
+        """Characters of content text that have entered the hold-back."""
+        return self._content_sanitizer.consumed
+
+    def _process_chunk_events(self, output: GenerationOutput) -> list[StreamEvent]:
+        """Build events before resolving content held across a tool boundary."""
         delta_text = output.new_text
         if not delta_text and not getattr(output, "tool_calls", None):
             # Handle finish-only chunks
@@ -2622,7 +2656,11 @@ class StreamingPostProcessor:
                 # supports an optional ``content`` payload; merging
                 # here keeps the terminal chunk count unchanged.
                 if self._ambiguous_prefix_held:
-                    flush = self._ambiguous_prefix_held
+                    # #4925: these bytes follow any content the sanitizer
+                    # still holds; resolve them in order and drain it, since
+                    # this finish event is the terminal content position.
+                    flush = self._content_sanitizer.process(self._ambiguous_prefix_held)
+                    flush += self._content_sanitizer.flush()
                     self._ambiguous_prefix_held = ""
                     finish_event = self._make_finish_event(output)
                     # Prepend the held bytes to whatever content the
@@ -2824,9 +2862,10 @@ class StreamingPostProcessor:
             # calls. Emit it before any early return, including cap rejection.
             structured_events = []
             if output.channel not in ("tool_call", "reasoning") and delta_text:
-                narration = sanitize_output(strip_special_tokens(delta_text))
+                narration = self._sanitize_content(
+                    strip_special_tokens(delta_text), accumulate=True
+                )
                 if narration:
-                    self.accumulated_text += narration
                     structured_events.append(
                         StreamEvent(type="content", content=narration)
                     )
@@ -2977,7 +3016,7 @@ class StreamingPostProcessor:
                 # rules out the tool half — otherwise enabling
                 # ``parallel_tool_calls=false`` silently drops
                 # assistant prose (codex r6 MAJOR). Apply the same
-                # strip_special_tokens + sanitize_output pipeline the
+                # strip_special_tokens + streaming sanitizer pipeline the
                 # plain-content branch (lines 850-852) uses so mixed
                 # preface/trailing content can't leak special markup
                 # to the client — codex r7 MAJOR.
@@ -2986,7 +3025,9 @@ class StreamingPostProcessor:
                 if isinstance(mixed_content, str) and mixed_content:
                     mixed_content = strip_special_tokens(mixed_content)
                     if mixed_content:
-                        mixed_content = sanitize_output(mixed_content)
+                        mixed_content = self._sanitize_content(
+                            mixed_content, accumulate=True
+                        )
                     if mixed_content:
                         events.append(
                             StreamEvent(type="content", content=mixed_content)
@@ -3062,7 +3103,7 @@ class StreamingPostProcessor:
 
         if self.tool_calls_detected:
             if self._preserve_post_tool_content and content:
-                content = sanitize_output(content)
+                content = self._sanitize_content(content, accumulate=True)
                 if content:
                     if output.finished:
                         return [
@@ -3106,7 +3147,7 @@ class StreamingPostProcessor:
             return []
 
         if content:
-            content = sanitize_output(content)
+            content = self._sanitize_content(content, accumulate=True)
             if not content:
                 content = None
 
@@ -3118,8 +3159,6 @@ class StreamingPostProcessor:
         # then sees ``reasoning_text=None`` and omits the field entirely,
         # creating stream/non-stream usage shape drift. Verified on
         # gemma-4-26b-4bit + gpt-oss-20b-mxfp4-q8 during the v0.6.66 onboarding sweep.
-        if content:
-            self.accumulated_text += content
         if reasoning:
             self.accumulated_reasoning += reasoning
 
@@ -3390,7 +3429,7 @@ class StreamingPostProcessor:
                 # tool half (codex r6 MAJOR: enabling
                 # ``parallel_tool_calls=false`` used to silently drop
                 # the preface when cap rejected the call). Apply the
-                # same strip_special_tokens + sanitize_output pipeline
+                # same strip_special_tokens + streaming sanitizer pipeline
                 # the plain-content branch (lines 835-839) uses so
                 # mixed preface/trailing content can't leak special
                 # markup to the client — codex r7 MAJOR.
@@ -3399,7 +3438,7 @@ class StreamingPostProcessor:
                 if isinstance(mixed_content, str) and mixed_content:
                     mixed_content = strip_special_tokens(mixed_content)
                     if mixed_content:
-                        mixed_content = sanitize_output(mixed_content)
+                        mixed_content = self._sanitize_content(mixed_content)
                     if mixed_content:
                         events.append(
                             StreamEvent(type="content", content=mixed_content)
@@ -3475,7 +3514,7 @@ class StreamingPostProcessor:
 
         if self.tool_calls_detected:
             if self._preserve_post_tool_content and content:
-                content = sanitize_output(content)
+                content = self._sanitize_content(content)
                 if content:
                     if output.finished:
                         return [
@@ -3519,7 +3558,7 @@ class StreamingPostProcessor:
             return []
 
         if content:
-            content = sanitize_output(content)
+            content = self._sanitize_content(content)
             if not content:
                 content = None
 
@@ -3609,7 +3648,7 @@ class StreamingPostProcessor:
                 # Combined content+tool delta — emit content half
                 # regardless of how the parallel-cap rules out the
                 # tool half (codex r6 MAJOR). Match the plain-content
-                # branch (line 1265) with ``sanitize_output`` so mixed
+                # branch with the streaming sanitizer so mixed
                 # preface/trailing content can't leak special markup
                 # — codex r7 MAJOR.
                 mixed_content = result.get("content")
@@ -3617,7 +3656,7 @@ class StreamingPostProcessor:
                 if isinstance(mixed_content, str) and mixed_content:
                     mixed_content = strip_special_tokens(mixed_content)
                     if mixed_content:
-                        mixed_content = sanitize_output(mixed_content)
+                        mixed_content = self._sanitize_content(mixed_content)
                     if mixed_content:
                         # R10-C7: mixed content+tool deltas also count
                         # as standard-path plain-content emission for
@@ -3706,7 +3745,7 @@ class StreamingPostProcessor:
 
         if self.tool_calls_detected:
             if self._preserve_post_tool_content and content:
-                content = sanitize_output(content)
+                content = self._sanitize_content(content)
                 if content:
                     if output.finished:
                         return [
@@ -3749,7 +3788,7 @@ class StreamingPostProcessor:
             return []
 
         if content:
-            content = sanitize_output(content)
+            content = self._sanitize_content(content)
             if not content:
                 content = None
 
@@ -3784,6 +3823,19 @@ class StreamingPostProcessor:
                 self._standard_content_observed = True
             return [StreamEvent(type="content", content=content)]
         return []
+
+    def _sanitize_content(self, content: str, *, accumulate: bool = False) -> str:
+        """Sanitize one content stream without losing split markup.
+
+        Channel-routed content accumulates sanitized output; the reasoning path
+        already accumulates raw parser input and the standard path does not
+        accumulate content. Remember which contract owns the held tail.
+        """
+        self._content_sanitizer_accumulates = accumulate
+        content = self._content_sanitizer.process(content)
+        if accumulate:
+            self.accumulated_text += content
+        return content
 
     def finalize(self) -> list[StreamEvent]:
         """Finalize stream — flush remaining tool calls, emit corrections.
@@ -4165,6 +4217,31 @@ class StreamingPostProcessor:
             # downstream.
             if isinstance(held, str) and held:
                 events.append(StreamEvent(type="content", content=held))
+
+        # Every EOF content release (reasoning-parser tails, parser-held
+        # bytes) is later in the same content stream than the sanitizer's
+        # held tail. Feed them through it in order, then drain it once, so
+        # split markup resolves exactly as in the buffered reply (#4925).
+        # The resolved text is emitted as one content event ahead of any
+        # recovered tool call, since all of it precedes the call on the wire.
+        resolved_parts = []
+        resolved_events = []
+        for event in events:
+            if event.type == "content":
+                if event.content:
+                    resolved_parts.append(
+                        self._content_sanitizer.process(event.content)
+                    )
+                continue
+            resolved_events.append(event)
+        events = resolved_events
+        resolved_parts.append(self._content_sanitizer.flush())
+        resolved_content = "".join(resolved_parts)
+        if self._content_sanitizer_accumulates:
+            # Accumulate exactly what this path emits at EOF, after split
+            # markup has resolved, so stripped bytes never land here.
+            self.accumulated_text += resolved_content
+        self._insert_content_before_tool_call(events, resolved_content)
 
         # H-07: ```json fence-strip on the finalize event list AND
         # drain any held tail in the SAME pass. The route's

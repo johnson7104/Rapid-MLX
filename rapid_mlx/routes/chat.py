@@ -7432,6 +7432,22 @@ async def stream_chat_completion(
                     entry.top_logprobs = []
             return ChoiceLogProbs(content=entries)
 
+        # #4925: the postprocessor can hold a token's text back until a later
+        # delta resolves possible markup. Keep that token's logprobs with it
+        # and release them on the chunk that finally carries the text.
+        _held_logprob_entries: list = []
+
+        def _with_held_logprobs(
+            logprobs: ChoiceLogProbs | None,
+        ) -> ChoiceLogProbs | None:
+            if not _held_logprob_entries:
+                return logprobs
+            entries = _held_logprob_entries + (
+                (logprobs.content or []) if logprobs else []
+            )
+            _held_logprob_entries.clear()
+            return ChoiceLogProbs(content=entries)
+
         # Pre-compute SSE template parts that don't change per-token.
         _sse_created = created if created is not None else int(time.time())
         _model_escaped = json.dumps(_resolve_model_name(request.model))
@@ -7781,11 +7797,34 @@ async def stream_chat_completion(
             if _chunk_matched_stop:
                 stream_matched_stop = _chunk_matched_stop
 
-            for event in processor.process_chunk(output):
+            _consumed_before = processor.content_consumed
+            _chunk_events = processor.process_chunk(output)
+            # A token whose text was held or stripped by the content
+            # hold-back reports its logprobs on the chunk that completes
+            # its text (or the terminal chunk), never before.
+            _defer_logprobs = (
+                want_logprobs
+                and processor.content_consumed != _consumed_before
+                and not any(e.type == "finish" for e in _chunk_events)
+                and (
+                    processor.content_held
+                    or not any(e.type == "content" for e in _chunk_events)
+                )
+            )
+            if _defer_logprobs:
+                _held_logprobs = _build_chunk_logprobs(output)
+                if _held_logprobs and _held_logprobs.content:
+                    _held_logprob_entries.extend(_held_logprobs.content)
+            # Each output's logprobs ride on exactly one content chunk.
+            _output_logprobs_pending = want_logprobs and not _defer_logprobs
+            for event in _chunk_events:
                 if event.type == "content":
                     _event_logprobs = (
-                        _build_chunk_logprobs(output) if want_logprobs else None
+                        _with_held_logprobs(_build_chunk_logprobs(output))
+                        if _output_logprobs_pending
+                        else None
                     )
+                    _output_logprobs_pending = False
                     if _buffer_forced_content:
                         if _forced_wire_quarantine:
                             # A channel boundary bisected marker-shaped content.
@@ -8613,7 +8652,9 @@ async def stream_chat_completion(
                             and finish_event.finish_reason != "length"
                             else finish_event.finish_reason
                         ),
-                        logprobs=_build_chunk_logprobs(finish_output),
+                        logprobs=_with_held_logprobs(
+                            _build_chunk_logprobs(finish_output)
+                        ),
                     )
                 ],
                 # See "Usage placement" note on the tool_call branch
