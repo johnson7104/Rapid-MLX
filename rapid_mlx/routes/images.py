@@ -23,7 +23,7 @@ from fastapi import (
 from starlette.responses import JSONResponse
 
 from ..api.models import ImageGenerationRequest, parse_image_size
-from ..middleware.auth import verify_api_key
+from ..middleware.auth import verify_api_key, verify_api_key_for_scope
 from ._async_utils import run_to_completion
 
 logger = logging.getLogger(__name__)
@@ -50,7 +50,7 @@ class _ImageBodyTooLargeError(Exception):
 
 
 class ImageBodyLimitMiddleware:
-    """Cap /v1/images/edits multipart bodies before FastAPI spools them.
+    """Authenticate and cap image edit bodies before FastAPI parses them.
 
     FastAPI resolves the ``UploadFile``/``Form`` params by parsing (and
     spooling) the whole multipart body before the endpoint runs, so an
@@ -70,6 +70,14 @@ class ImageBodyLimitMiddleware:
             or scope.get("path") != "/v1/images/edits"
         ):
             return await self.app(scope, receive, send)
+
+        try:
+            await verify_api_key_for_scope(scope)
+        except HTTPException as exc:
+            response = JSONResponse(
+                status_code=exc.status_code, content={"detail": exc.detail}
+            )
+            return await response(scope, receive, send)
 
         headers = {name.lower(): value for name, value in scope.get("headers", ())}
         advertised = headers.get(b"content-length")
