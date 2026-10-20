@@ -1013,6 +1013,8 @@ def _print_model_load_error(args: argparse.Namespace, exc: BaseException) -> Non
         "other",
         "corrupt_weights",
         "incompatible_weights",
+        "invalid_config",
+        "backend_load_failed",
     ) and (detail := startup_error_lines(exc, model_ref)):
         print(f"\n  Error loading model: {exc}", file=sys.stderr)
         print(f"  Cause: {detail[0]}", file=sys.stderr)
@@ -15066,29 +15068,84 @@ def main():
     ):
         from rapid_mlx.local_model_path import (
             local_model_failure_message,
+            local_serve_preflight_lines,
             raise_if_missing_local_model,
             resolved_model_ref,
+            validate_local_model_for_serve,
         )
         from rapid_mlx.model_aliases import RetiredModelAliasError, resolve_model
+        from rapid_mlx.model_load_errors import InvalidModelConfig
         from rapid_mlx.user_aliases import UserAliasError
 
+        resolved = args.model
+        validating_local_model = False
         try:
             supplied_model = args.model
             if getattr(args, "command", None) == "serve":
                 args.model = resolved_model_ref(args.model)
+                resolved = args.model
             raise_if_missing_local_model(args.model)
             resolved = resolve_model(args.model)
-        except FileNotFoundError as exc:
+            if getattr(args, "command", None) == "serve":
+                validating_local_model = True
+                validate_local_model_for_serve(resolved)
+        except (OSError, InvalidModelConfig) as exc:
+            if not validating_local_model and not isinstance(
+                exc, (FileNotFoundError, NotADirectoryError, PermissionError)
+            ):
+                print(f"\n  Error: Model resolution failed: {exc}", file=sys.stderr)
+                raise SystemExit(1) from None
             if getattr(args, "command", None) == "serve":
                 from rapid_mlx.telemetry.model_events import emit_model_serve_failed
 
                 emit_model_serve_failed(
-                    exc, alias_or_path=args.model, failure_stage="resolve"
+                    exc, alias_or_path=resolved, failure_stage="resolve"
                 )
-            message = local_model_failure_message(
-                supplied_model, exc, include_supplied_path=True
-            )
-            print(f"\n  Error: {message}", file=sys.stderr)
+            if getattr(args, "command", None) == "serve":
+                from rapid_mlx import log_file
+
+                try:
+                    target, source = log_file.resolve_validated(
+                        getattr(args, "log_file", None)
+                    )
+                    if target is not None and source is not None:
+                        log_file.apply(target, source)
+                except log_file.LogFileError as log_exc:
+                    print(f"error: {log_exc}", file=sys.stderr)
+                    raise SystemExit(2) from None
+                if isinstance(exc, InvalidModelConfig):
+                    from rapid_mlx.local_serve_diagnostics import startup_error_lines
+
+                    manifest_name = next(
+                        (
+                            name
+                            for name in (
+                                "model_index.json",
+                                "split_model.json",
+                                "params.json",
+                            )
+                            if f"Invalid model manifest: {name}" in str(exc)
+                        ),
+                        None,
+                    )
+                    if manifest_name is not None:
+                        cause, step = (
+                            f"Local {manifest_name} is invalid.",
+                            f"Restore {manifest_name} from the complete checkpoint, then retry `rapid-mlx serve {shlex.quote(resolved)}`.",
+                        )
+                    else:
+                        cause, step = startup_error_lines(exc, resolved) or (
+                            "Local config.json is invalid.",
+                            "Correct config.json, then retry `rapid-mlx serve /path/to/model`.",
+                        )
+                else:
+                    cause, step = local_serve_preflight_lines(resolved, exc)
+                print(f"\n  Cause: {cause}\n  Next step: {step}", file=sys.stderr)
+            else:
+                message = local_model_failure_message(
+                    supplied_model, exc, include_supplied_path=True
+                )
+                print(f"\n  Error: {message}", file=sys.stderr)
             raise SystemExit(1) from None
         except (RetiredModelAliasError, UserAliasError) as exc:
             print(f"\n  Error: {exc}", file=sys.stderr)
