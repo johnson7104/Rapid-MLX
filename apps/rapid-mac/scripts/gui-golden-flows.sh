@@ -5048,7 +5048,12 @@ flow_resident_load_rejected() {
 
 flow_launch_integrations() {
     log "flow: launch-integrations"
-    start_persona launch-integrations
+    # Persistent coding-agent rows save the local connection before copying
+    # (#4979). The isolated persona HOME has no login Keychain, so the journey
+    # opts into the app's process-local Keychain fixture instead of touching
+    # the runner's real Keychain.
+    start_persona launch-integrations \
+        RAPID_GUI_GOLDEN_MODE=1 RAPID_GUI_EPHEMERAL_KEYCHAIN_FIXTURE=1
     dismiss_first_run
     see_main "$OUT/main.json"
     press "$OUT/main.json" Sidebar.Launch "$OUT/launch.json"
@@ -5058,9 +5063,10 @@ flow_launch_integrations() {
     # first, then replaces it with the sidecar's authoritative integration
     # registry. The heading appears before that asynchronous load completes,
     # so capturing immediately makes the baseline race between two valid UI
-    # states. The page now leads with the connection contract and three common
-    # integrations, with the rest behind one disclosure in both stopped and
-    # ready states. Wait for that disclosure before asserting structure.
+    # states. The page now leads with the connection contract and the first
+    # nine registry rows ("Coding agents", #4979), with the rest behind one
+    # disclosure in both stopped and ready states. Wait for that disclosure
+    # before asserting structure.
     local i count=0
     for ((i=0; i<80; i++)); do
         see_main "$OUT/launch.json"
@@ -5148,10 +5154,10 @@ flow_launch_integrations() {
                       | (.identifier // "")
                       | select(startswith("Launch.Integration.Copy."))]
                      | unique | length' "$OUT/launch.json")"
-        [[ "$count" == 3 ]] && break
+        [[ "$count" == 9 ]] && break
         sleep 0.1
     done
-    [[ "$count" == 3 ]] || die "Cold Agent page did not return to 3 primary integrations"
+    [[ "$count" == 9 ]] || die "Cold Agent page did not return to 9 primary integrations (got $count)"
     baseline launch-integrations.complete "$OUT/launch.json"
 
     press "$OUT/launch.json" Sidebar.NewChat "$OUT/launch-chat.json" \
@@ -5159,7 +5165,7 @@ flow_launch_integrations() {
     start_model
     see_main "$OUT/launch-model-ready.json"
     press "$OUT/launch-model-ready.json" Sidebar.Launch "$OUT/launch-ready-open.json"
-    # Ready Launch leads with three common choices. The registry remains fully
+    # Ready Launch leads with nine coding-agent rows. The registry remains fully
     # reachable behind one explicit disclosure instead of occupying the page by
     # default.
     wait_identifier ConnectTools.MoreIntegrations "$OUT/launch-ready.json"
@@ -5168,8 +5174,8 @@ flow_launch_integrations() {
                          | select(((.identifier // "")
                                    | startswith("Launch.Integration.Copy."))
                                   and .enabled == true)] | length' "$OUT/launch-ready.json")"
-    [[ "$ready_copies" == 3 ]] \
-        || die "Ready Launch should lead with 3 common integrations, got $ready_copies"
+    [[ "$ready_copies" == 9 ]] \
+        || die "Ready Launch should lead with 9 primary integrations, got $ready_copies"
 
     # Compact cards keep shell syntax out of the first scan, while still
     # letting a user inspect the exact command before copying it.
@@ -5229,8 +5235,10 @@ flow_launch_integrations() {
             "$OUT/launch-copy-${integration_id##*.}.json" \
             || die "$integration_id is not pressable"
         copied_command="$(pbpaste)"
-        [[ -n "$copied_command" ]] \
-            || die "$integration_id pressed but copied no command"
+        if [[ -z "$copied_command" ]]; then
+            see_main "$OUT/launch-copy-failed-${integration_id##*.}.json" || true
+            die "$integration_id pressed but copied no command"
+        fi
     done < <(jq -r '[.data.ui_elements[]?
                       | select(((.identifier // "")
                                 | startswith("Launch.Integration.Copy."))
