@@ -259,11 +259,10 @@ def _installed_types(package: str, model_dirs: tuple[str, ...]) -> set[str] | No
     return names
 
 
-def supported_model_types() -> frozenset[str] | None:
-    """Every ``model_type`` some installed (or installable) loader constructs.
+def chat_model_types() -> frozenset[str] | None:
+    """``model_type`` values the text and vision loaders build (no speech).
 
-    ``None`` means the inventory cannot be established (mlx-lm missing or its
-    layout unreadable); callers must then give no architecture verdict.
+    ``None`` when the mlx-lm inventory cannot be established.
     """
     text_types = _installed_types("mlx_lm", ("models",))
     if text_types is None:
@@ -275,6 +274,18 @@ def supported_model_types() -> frozenset[str] | None:
         from rapid_mlx.byom._vlm_model_types import MLX_VLM_MODEL_TYPES
 
         vision_types = set(MLX_VLM_MODEL_TYPES)
+    return frozenset(text_types | vision_types | RAPID_MODEL_TYPES)
+
+
+def supported_model_types() -> frozenset[str] | None:
+    """Every ``model_type`` some installed (or installable) loader constructs.
+
+    ``None`` means the inventory cannot be established (mlx-lm missing or its
+    layout unreadable); callers must then give no architecture verdict.
+    """
+    chat_types = chat_model_types()
+    if chat_types is None:
+        return None
     # Speech runtimes (the optional [audio] extra), when installed. Speech
     # checkpoints are rarely decoder-only, but a TTS built on a causal LM is.
     audio_dirs = (
@@ -287,7 +298,7 @@ def supported_model_types() -> frozenset[str] | None:
     if audio_root is not None:
         for sub in audio_dirs:
             audio_types |= _module_names(audio_root / sub)
-    return frozenset(text_types | vision_types | audio_types | RAPID_MODEL_TYPES)
+    return frozenset(chat_types | audio_types)
 
 
 def _mlx_lm_version() -> str | None:
@@ -822,11 +833,28 @@ def _emit_rejection(args: Any, exc: PreflightRejectedError) -> None:
         emit_model_pull_failed(exc, model_ref=shown)
 
 
+def _note_uncataloged_serve(args: Any) -> None:
+    """Identify local models whose catalog compatibility has not been tested."""
+    ref = str(getattr(args, "_original_alias", None) or getattr(args, "model", ""))
+    if (
+        args.command == "serve"
+        and not getattr(args, "_serve_default_selected", False)
+        and not _is_catalog_or_registry_model(ref)
+    ):
+        from rapid_mlx.local_models import serve_startup_note
+
+        serve_startup_note(
+            args,
+            f"  Note: {ref} is not in the Rapid-MLX catalog, "
+            "so it has not been catalog-tested here.",
+        )
+
+
 def run_cli_preflight(args: Any, *, spinner_factory: Callable[[str], Any]) -> None:
     """Run the preflight for ``serve``/``pull`` args; exit 1 on a rejection.
 
-    Silent (no output, no state change) for every model it does not apply to
-    and whenever metadata cannot be read. On an interactive terminal a passing
+    Cached or offline uncataloged serve targets receive a compatibility note.
+    Unreadable local metadata stays silent. On an interactive terminal a passing
     check prints a short summary before the download starts.
     """
     funnel = _funnel()
@@ -837,6 +865,8 @@ def run_cli_preflight(args: Any, *, spinner_factory: Callable[[str], Any]) -> No
         raise SystemExit(1)
     unchecked, target = _target_status(args)
     if target is None:
+        if unchecked in ("cached", "no_verdict"):
+            _note_uncataloged_serve(args)
         if unchecked is not None:
             funnel.set_preflight(unchecked)
         return
@@ -850,6 +880,8 @@ def run_cli_preflight(args: Any, *, spinner_factory: Callable[[str], Any]) -> No
             inspection = inspect_hub(ref)
     if inspection is None:
         return
+    if is_local:
+        _note_uncataloged_serve(args)
     supported = supported_model_types()
     # ``pull`` is storage-only and may target another Mac, and ``--disk-stream``
     # serves MoE experts from disk; only a plain ``serve`` refuses a checkpoint
