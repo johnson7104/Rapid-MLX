@@ -967,6 +967,88 @@ def _make_args(**overrides):
 
 
 class TestLaunchCommand:
+    def test_claude_desktop_prints_in_app_values_without_touching_client(
+        self, fake_home, monkeypatch, capsys
+    ):
+        from rapid_mlx.agents import isolated
+        from rapid_mlx.launch import claude_desktop
+
+        calls = []
+        monkeypatch.setattr(
+            claude_desktop,
+            "configure",
+            lambda model, **options: (
+                calls.append((model, options)) or ("http://127.0.0.1:7796", "test-key")
+            ),
+        )
+        monkeypatch.setattr(isolated, "connection_status", lambda *_: "key-mismatch")
+        launch_cli.launch_command(
+            _make_args(client="claude-desktop", model="local-model", port=7796)
+        )
+        assert calls == [
+            (
+                "local-model",
+                {"opus": None, "sonnet": None, "haiku": None, "port": 7796},
+            )
+        ]
+        output = capsys.readouterr().out
+        assert "Gateway URL: http://127.0.0.1:7796" in output
+        assert "API key: test-key" in output
+        assert "Restart the local server" in output
+        assert "Apply Changes" in output
+        assert not (
+            fake_home / "Library" / "Application Support" / "Claude-3p"
+        ).exists()
+
+    @pytest.mark.parametrize(
+        ("status", "message"),
+        [
+            ("model-mismatch", "Start local-model on this port before Test"),
+            ("stopped", "Start the local server before Test"),
+        ],
+    )
+    def test_claude_desktop_reports_gateway_state(
+        self, fake_home, monkeypatch, capsys, status, message
+    ):
+        from rapid_mlx.agents import isolated
+        from rapid_mlx.launch import claude_desktop
+
+        monkeypatch.setattr(
+            claude_desktop,
+            "configure",
+            lambda *_args, **_kwargs: ("http://127.0.0.1:7796", "test-key"),
+        )
+        monkeypatch.setattr(isolated, "connection_status", lambda *_: status)
+        launch_cli.launch_command(
+            _make_args(client="claude-desktop", model="local-model", port=7796)
+        )
+        assert message in capsys.readouterr().out
+
+    def test_claude_desktop_dry_run_and_remove_do_not_touch_client(
+        self, fake_home, monkeypatch, capsys
+    ):
+        from rapid_mlx.launch import claude_desktop
+
+        mapping = fake_home / "claude-desktop.json"
+        mapping.write_text("saved", encoding="utf-8")
+        monkeypatch.setattr(claude_desktop, "mapping_path", lambda: mapping)
+        launch_cli.launch_command(_make_args(client="claude-desktop", dry_run=True))
+        assert mapping.read_text(encoding="utf-8") == "saved"
+        assert "Claude Desktop is untouched" in capsys.readouterr().out
+        launch_cli.launch_command(_make_args(client="claude-desktop", remove=True))
+        assert not mapping.exists()
+        assert "mapping disabled" in capsys.readouterr().out
+
+    def test_claude_desktop_requires_suitable_local_model(
+        self, fake_home, monkeypatch, capsys
+    ):
+        from rapid_mlx.run import cli as run_cli
+
+        monkeypatch.setattr(run_cli, "_select_model", lambda **_kwargs: None)
+        with pytest.raises(SystemExit, match="1"):
+            launch_cli.launch_command(_make_args(client="claude-desktop"))
+        assert "no tool-capable model fits" in capsys.readouterr().err
+
     def test_list_prints_all_clients(self, fake_home, capsys):
         with pytest.raises(SystemExit) as excinfo:
             launch_cli.launch_command(_make_args(client="list"))
@@ -981,11 +1063,17 @@ class TestLaunchCommand:
         assert excinfo.value.code == 0
         targets = json.loads(capsys.readouterr().out)
         ids = [target["id"] for target in targets]
-        assert len(ids) == len(set(ids)) == 18
+        assert len(ids) == len(set(ids)) == 19
         assert "deepseek-harness" in ids
-        # The launch registry's four config writers lead in display order;
-        # pi is the highest-starred agents profile not already covered.
-        assert ids[:5] == ["cline", "claude-code", "continue-dev", "cursor", "pi"]
+        # Claude Desktop uses the in-app gateway flow and never writes its config.
+        assert ids[:6] == [
+            "claude-desktop",
+            "cline",
+            "claude-code",
+            "continue-dev",
+            "cursor",
+            "pi",
+        ]
         assert {target["kind"] for target in targets} == {
             "config_writer",
             "adapter_profile",

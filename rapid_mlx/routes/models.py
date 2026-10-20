@@ -16,6 +16,7 @@ from types import SimpleNamespace
 from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException
+from fastapi.responses import JSONResponse
 
 from ..agents.codex_catalog import build_codex_model_info
 from ..api.models import ModelInfo, ModelsResponse, SpeculativeDecodingInfo
@@ -1264,8 +1265,10 @@ def _build_codex_model_info(info: ModelInfo) -> dict:
     return build_codex_model_info(info.id, info.context_window)
 
 
-@router.get("/v1/models", dependencies=[Depends(verify_api_key)])
-async def list_models() -> ModelsResponse:
+@router.get(
+    "/v1/models", dependencies=[Depends(verify_api_key)], response_model=ModelsResponse
+)
+async def list_models() -> ModelsResponse | JSONResponse:
     """List available models (supports multi-model).
 
     Each entry carries the Rapid-MLX vendor extension fields when
@@ -1310,7 +1313,28 @@ async def list_models() -> ModelsResponse:
     codex_models = [
         _build_codex_model_info(info) for info in models if "text" in info.capabilities
     ]
-    return ModelsResponse(data=models, models=codex_models)
+    response = ModelsResponse(data=models, models=codex_models)
+    from rapid_mlx.launch.claude_desktop import mappings
+
+    assigned = mappings()
+    if not assigned:
+        return response
+    payload = response.model_dump(mode="json")
+    by_id = {info.id: info for info in models}
+    for tier, model_id in assigned.items():
+        info = by_id.get(model_id)
+        if info is None or "tools" not in info.capabilities:
+            continue
+        alias = f"claude-{tier}-rapid-mlx"
+        entry = info.model_dump(mode="json")
+        entry.update(
+            id=alias,
+            anthropic_family_tier=tier,
+            is_family_default=True,
+            display_name=f"Claude {tier.title()} · {model_id}",
+        )
+        payload["data"].append(entry)
+    return JSONResponse(payload)
 
 
 @router.get("/v1/models/{model_id:path}", dependencies=[Depends(verify_api_key)])

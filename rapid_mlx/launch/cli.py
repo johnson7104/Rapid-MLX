@@ -35,6 +35,7 @@ import signal
 import subprocess
 import sys
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from . import ADAPTERS, CLIENT_ALIASES, canonical_client, cursor
 
@@ -66,6 +67,7 @@ def _print_list(*, as_json: bool = False) -> int:
     for name, adapter in ADAPTERS.items():
         status = "detected" if adapter.detect() else "not detected"
         print(f"  {name.ljust(width)}{status}")
+    print("  claude-desktop  in-app gateway setup")
     print("\nNote: cursor requires an explicit public HTTPS --server-url.")
     return 0
 
@@ -183,6 +185,56 @@ def launch_command(args: argparse.Namespace) -> None:
 
     if args.client == "list":
         sys.exit(_print_list(as_json=args.json))
+
+    if args.client == "claude-desktop":
+        from rapid_mlx.agents import get_profile
+        from rapid_mlx.agents.isolated import connection_status
+        from rapid_mlx.launch import claude_desktop
+        from rapid_mlx.run.cli import _select_model
+
+        if args.dry_run:
+            print(
+                "[dry-run] Would save Rapid's Claude Desktop tier mapping; Claude Desktop is untouched."
+            )
+            return
+        if getattr(args, "remove", False):
+            claude_desktop.mapping_path().unlink(missing_ok=True)
+            print("Claude Desktop tier mapping disabled in Rapid-MLX.")
+            return
+        model = getattr(args, "_original_alias", None) or _select_model(
+            explicit=args.model, profile=get_profile("claude-code"), no_download=False
+        )
+        if model is None:
+            print(
+                "launch: no tool-capable model fits this Mac; choose --model",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        url, gateway_key = claude_desktop.configure(
+            model,
+            opus=getattr(args, "opus_model", None),
+            sonnet=getattr(args, "sonnet_model", None),
+            haiku=getattr(args, "haiku_model", None),
+            port=args.port,
+        )
+        print("Claude Desktop gateway (configure inside Claude Desktop):")
+        print(f"  Gateway URL: {url}\n  API key: {gateway_key}")
+        gateway_port = urlsplit(url).port
+        assert gateway_port is not None
+        status = connection_status(gateway_port, gateway_key, model)
+        if status == "key-mismatch":
+            print(
+                "  Restart the local server to activate this saved API key before Test."
+            )
+        elif status == "model-mismatch":
+            print(f"  Start {model} on this port before Test.")
+        elif status != "ready":
+            print("  Start the local server before Test.")
+        print("  1. Help → Troubleshooting → Enable Developer Mode")
+        print("  2. Developer → Configure Third-Party Inference → Gateway")
+        print("  3. Paste the URL and API key; Test connection")
+        print("  4. Apply Changes")
+        return
 
     from rapid_mlx.agents.isolated import SUPPORTED, saved_model
 
@@ -604,6 +656,9 @@ def register(subparsers) -> None:
             "(default: $RAPID_MLX_DEFAULT_MODEL or qwen3.5-4b-4bit)."
         ),
     )
+    p.add_argument("--opus-model", help="Local model assigned to the opus tier")
+    p.add_argument("--sonnet-model", help="Local model assigned to the sonnet tier")
+    p.add_argument("--haiku-model", help="Local model assigned to the haiku tier")
     p.add_argument(
         "--server-url",
         type=str,

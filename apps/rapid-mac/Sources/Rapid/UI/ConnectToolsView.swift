@@ -233,6 +233,7 @@ struct ConnectToolsView: View {
             // collection of product-specific shell commands instead of a
             // local server that works with any compatible client.
             endpointSection
+            claudeDesktopSection
 
             if snippetModel.lowercased().contains("gemma-4-12b-it") {
                 Text("Codex can stall on tool calls with this model. Choose a recommended Qwen model for coding agents.")
@@ -424,6 +425,27 @@ struct ConnectToolsView: View {
         }
     }
 
+    private var claudeDesktopSection: some View {
+        VStack(alignment: .leading, spacing: RapidTheme.Space.sm) {
+            SectionHeader("Claude Desktop", subtitle: "Use its official in-app Gateway setup.")
+            VStack(alignment: .leading, spacing: RapidTheme.Space.sm) {
+                CopyableRow(label: "Gateway URL", value: anthropicBaseURL)
+                rowDivider
+                CopyableRow(label: "Gateway API key", value: bearer, masked: true,
+                            placeholder: "Created when the server starts")
+                rowDivider
+                Text("Run the setup command below to enable Rapid's tier mapping, then in Claude Desktop:")
+                Text("1. Help → Troubleshooting → Enable Developer Mode.")
+                Text("2. Developer → Configure Third-Party Inference.")
+                Text("3. Choose Gateway, paste the URL and API key above, then Test.")
+                Text("4. Apply Changes.")
+            }
+            .font(RapidFont.caption)
+            .padding(RapidTheme.Space.md)
+            .groupedCard()
+        }
+    }
+
     private func toolsSection(
         _ displayedTools: [ConnectTool],
         title: String = "Editors and agents"
@@ -507,6 +529,19 @@ struct ConnectToolsView: View {
     private var tools: [ConnectTool] {
         guard !integrationTargets.isEmpty else { return legacyTools }
         return IntegrationCatalog.displayOrdered(integrationTargets).map { target in
+            if target.id == "claude-desktop" {
+                let command = "\(cliCommand) launch claude-desktop --model \(IntegrationLaunchCommand.shellQuote(snippetModel))"
+                return ConnectTool(
+                    id: target.id,
+                    name: target.name,
+                    symbol: "desktopcomputer",
+                    blurb: "Enable local tier mapping, then paste the Gateway URL and API key into Claude Desktop.",
+                    snippet: command,
+                    displaySnippet: command,
+                    action: .guide,
+                    persistent: true
+                )
+            }
             if IntegrationCatalog.isolatedAgentIDs.contains(target.id) {
                 let command = IntegrationLaunchCommand.isolated(
                     id: target.id, model: snippetModel, cli: cliCommand, run: true
