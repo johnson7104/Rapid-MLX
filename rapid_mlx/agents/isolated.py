@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import secrets
@@ -33,6 +34,25 @@ SUPPORTED = frozenset(
     }
 )
 _API_KEY_ENV = "RAPID_MLX_API_KEY"
+_GIT_PASSTHROUGH = frozenset(
+    {
+        "GIT_AUTHOR_NAME",
+        "GIT_AUTHOR_EMAIL",
+        "GIT_AUTHOR_DATE",
+        "GIT_COMMITTER_NAME",
+        "GIT_COMMITTER_EMAIL",
+        "GIT_COMMITTER_DATE",
+        "GIT_CONFIG_GLOBAL",
+        "GIT_CONFIG_SYSTEM",
+        "GIT_CONFIG_NOSYSTEM",
+        "GIT_CONFIG_COUNT",
+        "GIT_SSH",
+        "GIT_SSH_COMMAND",
+        "GIT_SSH_VARIANT",
+        "GIT_ASKPASS",
+        "GIT_TERMINAL_PROMPT",
+    }
+)
 _HERMES_MIN_CONTEXT = 64_000
 _HERMES_MAX_CONTEXT = 131_072
 
@@ -87,6 +107,17 @@ def _private_write(path: Path, content: str) -> None:
     except BaseException:
         os.close(fd)
         raise
+
+
+def _private_python_launcher(path: Path, source: str) -> None:
+    script = path.with_suffix(".py")
+    _private_write(script, source)
+    _private_write(
+        path,
+        f"#!/bin/sh\nexec {shlex.quote(sys.executable)} -I "
+        f'{shlex.quote(str(script))} "$@"\n',
+    )
+    path.chmod(0o700)
 
 
 def stable_key(*, create: bool = True) -> str | None:
@@ -241,13 +272,21 @@ def _command(name: str, root: Path, model: str, port: int) -> str:
         return f"{credential} XDG_CONFIG_HOME={quote(str(root))} GOOSE_MODEL={quote(model)} goose session --provider custom_rapid_mlx"
     if name == "crush":
         return (
-            f"{credential} CRUSH_GLOBAL_CONFIG={quote(str(root / 'crush.json'))} crush"
+            f"{credential} CRUSH_GLOBAL_CONFIG={quote(str(root))} "
+            f"CRUSH_GLOBAL_DATA={quote(str(root / 'global-data'))} "
+            f"{quote(str(root / 'bin' / 'crush-launch'))}"
         )
     if name == "aider":
-        return f'OPENAI_API_KEY="$(cat {key})" aider --env-file {quote(str(root / "aider.env"))} --model openai/{quote(model)}'
+        return quote(str(root / "bin" / "aider-launch"))
     if name == "qwen-code":
         saved_port = quote(str(port_path()))
-        return f'OPENAI_API_KEY="$(cat {key})" OPENAI_BASE_URL="http://127.0.0.1:$(cat {saved_port})/v1" OPENAI_MODEL={quote(model)} qwen'
+        base = f'"http://127.0.0.1:$(cat {saved_port})/v1"'
+        return (
+            f"QWEN_HOME={quote(str(root))} QWEN_RUNTIME_DIR={quote(str(root / 'runtime'))} "
+            f'OPENAI_API_KEY="$(cat {key})" OPENAI_BASE_URL={base} '
+            f"OPENAI_MODEL={quote(model)} qwen --bare --auth-type openai "
+            f"--model {quote(model)} --openai-base-url {base}"
+        )
     if name == "claude-code":
         return f"claude --settings {quote(str(root / 'settings.json'))}"
     raise ValueError(f"unsupported isolated agent: {name}")
@@ -265,12 +304,140 @@ def configure(
     if profile is None or profile.name not in SUPPORTED:
         raise ValueError(f"unsupported isolated agent: {name}")
     name = profile.name
+    if name in ("aider", "crush"):
+        git_discovery_env = {
+            key: value
+            for key, value in os.environ.items()
+            if not key.startswith("GIT_")
+        }
+    if name == "aider":
+        cwd = Path.cwd()
+        git = shutil.which("git")
+        if git is None:
+            raise ValueError("isolated aider launch requires git")
+        git_root = (
+            subprocess.run(
+                [git, "rev-parse", "--show-toplevel"],
+                cwd=cwd,
+                env=git_discovery_env,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if git
+            else None
+        )
+        dirs = {cwd}
+        if git_root and git_root.returncode == 0:
+            dirs.add(Path(git_root.stdout.strip()).resolve())
+        if any(
+            (directory / filename).exists() or (directory / filename).is_symlink()
+            for directory in dirs
+            for filename in (".aider.conf.yml", ".aider.model.settings.yml", ".env")
+        ):
+            raise ValueError(
+                "isolated aider launch cannot override project configuration"
+            )
+    if name == "crush":
+        # Project config outranks CRUSH_GLOBAL_CONFIG and may select a cloud
+        # endpoint. Crush stops discovery at the Git root (or cwd outside Git).
+        # Refuse before creating any private launch state.
+        cwd = Path.cwd()
+        git = shutil.which("git")
+        git_root = (
+            subprocess.run(
+                [git, "rev-parse", "--show-toplevel"],
+                cwd=cwd,
+                env=git_discovery_env,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if git
+            else None
+        )
+        boundary = (
+            Path(git_root.stdout.strip()).resolve()
+            if git_root and git_root.returncode == 0
+            else cwd
+        )
+        for directory in (cwd, *cwd.parents):
+            if any(
+                (directory / filename).exists() or (directory / filename).is_symlink()
+                for filename in (".crushrc", "crushrc", ".crush.json", "crush.json")
+            ):
+                raise ValueError(
+                    "isolated crush launch cannot override project configuration"
+                )
+            if directory == boundary:
+                break
     port = port or stable_port()
     save_port(port)
     key = stable_key()
     assert key is not None
     root = connection_dir() / "agents" / name
     _private_dir(root)
+    if name == "qwen-code":
+        _private_dir(root / "runtime")
+    if name == "aider":
+        _private_dir(root / "home")
+        assert git is not None
+        git_shim = root / "bin" / "git"
+        _private_write(
+            git_shim,
+            f"#!/bin/sh\nHOME={shlex.quote(str(Path.home()))} "
+            f'exec {shlex.quote(git)} "$@"\n',
+        )
+        git_shim.chmod(0o700)
+    if name == "crush":
+        # UI model selections in either higher-precedence layer must not
+        # override the model just selected in Rapid. Keep session databases.
+        project_id = hashlib.sha256(str(Path.cwd().resolve()).encode()).hexdigest()[:24]
+        _private_dir(root / "global-data")
+        _private_dir(root / "data" / project_id)
+        for saved_config in (
+            root / "global-data" / "crush.json",
+            root / "data" / project_id / "crush.json",
+        ):
+            _reject_symlinked_ancestors(saved_config)
+            if saved_config.is_file():
+                try:
+                    saved = json.loads(saved_config.read_text())
+                except (json.JSONDecodeError, UnicodeError) as exc:
+                    raise ValueError(
+                        f"invalid isolated crush saved configuration: {saved_config}"
+                    ) from exc
+                if not isinstance(saved, dict):
+                    raise ValueError("invalid isolated crush saved configuration")
+                saved.pop("providers", None)
+                models = saved.get("models")
+                models = models if isinstance(models, dict) else {}
+                tuning = {
+                    "max_tokens",
+                    "temperature",
+                    "top_p",
+                    "top_k",
+                    "frequency_penalty",
+                    "presence_penalty",
+                }
+                pinned = {}
+                for slot in ("large", "small"):
+                    pinned[slot] = {"provider": "rapid-mlx", "model": model}
+                    selected = models.get(slot)
+                    if isinstance(selected, dict):
+                        pinned[slot].update(
+                            {
+                                field: value
+                                for field, value in selected.items()
+                                if field in tuning
+                            }
+                        )
+                saved["models"] = pinned
+                options = saved.get("options")
+                if isinstance(options, dict):
+                    options.pop("data_directory", None)
+                    options.pop("disable_default_providers", None)
+                _private_write(saved_config, json.dumps(saved, indent=2) + "\n")
     _private_write(root / "model", model + "\n")
     base = f"http://127.0.0.1:{port}/v1"
     previous = os.environ.get("RAPID_MLX_API_KEY")
@@ -387,16 +554,77 @@ def configure(
         }
         _private_write(root / "settings.json", json.dumps(settings, indent=2) + "\n")
     elif name == "aider":
-        _private_write(root / "aider.env", f"OPENAI_API_BASE={base}\n")
+        _private_write(
+            root / "aider.env",
+            f"AIDER_OPENAI_API_KEY={key}\nOPENAI_API_KEY={key}\n"
+            f"AIDER_OPENAI_API_BASE={base}\nOPENAI_API_BASE={base}\n",
+        )
+        _private_write(root / "aider.conf.yml", "{}\n")
+        helper = root / "bin" / "aider-launch"
+        _private_python_launcher(
+            helper,
+            "import os\nfrom pathlib import Path\n"
+            f"root = Path({str(root)!r})\n"
+            f"key_path = Path({str(key_path())!r})\n"
+            f"port_path = Path({str(port_path())!r})\n"
+            f"model = {model!r}\n"
+            f"allowed_git = {tuple(sorted(_GIT_PASSTHROUGH))!r}\n"
+            "source = os.environ\n"
+            "environment = {'PATH': str(root / 'bin') + os.pathsep + source.get('PATH', ''), "
+            "'HOME': str(root / 'home'), 'TERM': source.get('TERM', 'xterm-256color')}\n"
+            "for name in ('SSH_AUTH_SOCK', 'SSH_ASKPASS', 'GPG_TTY', 'GNUPGHOME', "
+            "'EMAIL', 'LANG', 'LC_ALL'):\n"
+            "    if name in source:\n        environment[name] = source[name]\n"
+            "for name, value in source.items():\n"
+            "    indexed = name.startswith(('GIT_CONFIG_KEY_', 'GIT_CONFIG_VALUE_')) "
+            "and name.rsplit('_', 1)[-1].isdigit()\n"
+            "    valid = name.isascii() and all(c.isupper() or c.isdigit() or c == '_' "
+            "for c in name)\n"
+            "    if valid and (name in allowed_git or indexed):\n"
+            "        environment[name] = value\n"
+            "local_key = key_path.read_text().strip()\n"
+            "base = 'http://127.0.0.1:' + port_path.read_text().strip() + '/v1'\n"
+            "environment.update({'AIDER_OPENAI_API_KEY': local_key, "
+            "'OPENAI_API_KEY': local_key, 'AIDER_OPENAI_API_BASE': base, "
+            "'OPENAI_API_BASE': base})\n"
+            "selected_model = 'openai/' + model\n"
+            "args = ['aider', '--config', str(root / 'aider.conf.yml'), "
+            "'--env-file', str(root / 'aider.env'), '--openai-api-base', base, "
+            "'--model', selected_model, '--weak-model', selected_model, "
+            "'--editor-model', selected_model]\n"
+            "os.execvpe('aider', args, environment)\n",
+        )
     elif name == "qwen-code":
         _private_write(
             root / "qwen.env", f"OPENAI_BASE_URL={base}\nOPENAI_MODEL={model}\n"
         )
+    if name == "crush":
+        helper = root / "bin" / "crush-launch"
+        _private_python_launcher(
+            helper,
+            "import hashlib\nimport os\nfrom pathlib import Path\n"
+            f"data_root = Path({str(root / 'data')!r})\n"
+            "project_id = hashlib.sha256(str(Path.cwd().resolve()).encode()).hexdigest()[:24]\n"
+            f"allowed_git = {tuple(sorted(_GIT_PASSTHROUGH))!r}\n"
+            "source = os.environ\n"
+            "environment = {key: value for key, value in source.items() "
+            "if not key.startswith('GIT_')}\n"
+            "for name, value in source.items():\n"
+            "    indexed = name.startswith(('GIT_CONFIG_KEY_', 'GIT_CONFIG_VALUE_')) "
+            "and name.rsplit('_', 1)[-1].isdigit()\n"
+            "    valid = name.isascii() and all(c.isupper() or c.isdigit() or c == '_' "
+            "for c in name)\n"
+            "    if valid and (name in allowed_git or indexed):\n"
+            "        environment[name] = value\n"
+            "os.execvpe('crush', ['crush', '--data-dir', str(data_root / project_id)], environment)\n",
+        )
     command = _command(name, root, model, port)
     cli = _cli_invocation()
     runner = root / "run"
-    # A different Desktop session may have chosen a new free port or rotated
-    # the key. Refresh the private config only after the shared route validates.
+    # Reconfigure in the runner's execution directory before starting the
+    # agent. This repeats project-config guards and sanitizes that project's
+    # saved state, including when a saved runner is reused in another project.
+    # A different Desktop session may also have chosen a new port or key.
     refresh = (
         ""
         if name == "hermes"

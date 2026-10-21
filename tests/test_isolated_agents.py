@@ -1,11 +1,13 @@
 """Day-two configurations stay private and never rewrite existing agent state."""
 
+import hashlib
 import json
 import os
 import shutil
 import signal
 import stat
 import subprocess
+import sys
 import urllib.error
 from argparse import ArgumentParser, Namespace
 from pathlib import Path
@@ -52,7 +54,12 @@ def test_profiles_are_isolated_idempotent_and_removable(private_home):
             p.relative_to(root): p.read_bytes() for p in root.rglob("*") if p.is_file()
         }
         assert all(
-            stat.S_IMODE(p.stat().st_mode) == (0o700 if p.name == "run" else 0o600)
+            stat.S_IMODE(p.stat().st_mode)
+            == (
+                0o700
+                if p.name in ("run", "git", "crush-launch", "aider-launch")
+                else 0o600
+            )
             for p in root.rglob("*")
             if p.is_file()
         )
@@ -956,3 +963,525 @@ def test_qwen_runner_reads_current_port_after_saved_port_moves(
     runner = isolated.connection_dir() / "agents" / "qwen-code" / "run"
     subprocess.run([shutil.which("zsh") or "/bin/bash", str(runner)], check=True)
     assert capture.read_text() == "http://127.0.0.1:7661/v1"
+
+
+def test_qwen_runner_overrides_saved_cloud_auth_without_editing_it(
+    private_home, monkeypatch
+):
+    settings = private_home / ".qwen/settings.json"
+    settings.parent.mkdir()
+    original = (
+        b'{"security":{"auth":{"selectedType":"qwen-oauth"}},'
+        b'"model":{"name":"cloud"},'
+        b'"modelProviders":{"openai":[{"id":"qwen3.5-9b-4bit",'
+        b'"baseUrl":"https://cloud.example/v1","envKey":"CLOUD_KEY"}]}}\n'
+    )
+    settings.write_bytes(original)
+    commands = private_home / "commands"
+    commands.mkdir()
+    rapid = commands / "rapid-mlx"
+    rapid.write_text("#!/bin/sh\nexit 0\n")
+    rapid.chmod(0o700)
+    qwen = commands / "qwen"
+    qwen.write_text(
+        '#!/bin/sh\nprintf "%s\\n" "$@" > "$TEST_CAPTURE"\n'
+        'printf "%s" "$QWEN_HOME" > "$TEST_QWEN_HOME_CAPTURE"\n'
+        'printf "%s" "$QWEN_RUNTIME_DIR" > "$TEST_QWEN_RUNTIME_CAPTURE"\n'
+    )
+    qwen.chmod(0o700)
+    monkeypatch.setenv("HOME", str(private_home))
+    monkeypatch.setenv("PATH", f"{commands}:{os.environ['PATH']}")
+    capture = private_home / "qwen-args"
+    home_capture = private_home / "qwen-home"
+    runtime_capture = private_home / "qwen-runtime"
+    monkeypatch.setenv("QWEN_RUNTIME_DIR", str(private_home / "existing-runtime"))
+    monkeypatch.setenv("TEST_CAPTURE", str(capture))
+    monkeypatch.setenv("TEST_QWEN_HOME_CAPTURE", str(home_capture))
+    monkeypatch.setenv("TEST_QWEN_RUNTIME_CAPTURE", str(runtime_capture))
+    with patch("rapid_mlx.agents.isolated._cli_invocation", return_value=str(rapid)):
+        isolated.configure("qwen-code", "qwen3.5-9b-4bit", port=7660)
+    runner = isolated.connection_dir() / "agents" / "qwen-code" / "run"
+    subprocess.run([shutil.which("zsh") or "/bin/bash", str(runner)], check=True)
+    args = capture.read_text().splitlines()
+    assert "--bare" in args
+    assert args[args.index("--auth-type") + 1] == "openai"
+    assert args[args.index("--model") + 1] == "qwen3.5-9b-4bit"
+    assert args[args.index("--openai-base-url") + 1] == "http://127.0.0.1:7660/v1"
+    assert home_capture.read_text() == str(
+        isolated.connection_dir() / "agents" / "qwen-code"
+    )
+    assert runtime_capture.read_text() == str(
+        isolated.connection_dir() / "agents" / "qwen-code" / "runtime"
+    )
+    assert settings.read_bytes() == original
+
+
+def test_crush_runner_uses_private_config_directory(private_home, monkeypatch):
+    user_config = private_home / ".config/crush/crush.json"
+    user_config.parent.mkdir(parents=True)
+    original = b'{"models":{"large":{"provider":"cloud","model":"cloud"}}}\n'
+    user_config.write_bytes(original)
+    commands = private_home / "commands"
+    commands.mkdir()
+    rapid = commands / "rapid-mlx"
+    rapid.write_text("#!/bin/sh\nexit 0\n")
+    rapid.chmod(0o700)
+    crush = commands / "crush"
+    crush.write_text(
+        '#!/bin/sh\ntest -f "$CRUSH_GLOBAL_CONFIG/crush.json" || exit 8\n'
+        'printf "%s" "$CRUSH_GLOBAL_CONFIG" > "$TEST_CAPTURE"\n'
+        'printf "%s" "$CRUSH_GLOBAL_DATA" > "$TEST_DATA_CAPTURE"\n'
+        'printf "%s\\n" "$@" > "$TEST_ARGS_CAPTURE"\n'
+        'printf "%s" "${GIT_DIR:-}" > "$TEST_GIT_CAPTURE"\n'
+        'printf "%s" "${GIT_AUTHOR_NAME:-}" > "$TEST_AUTHOR_CAPTURE"\n'
+    )
+    crush.chmod(0o700)
+    monkeypatch.setenv("HOME", str(private_home))
+    monkeypatch.setenv("PATH", f"{commands}:{os.environ['PATH']}")
+    capture = private_home / "crush-config-dir"
+    args_capture = private_home / "crush-args"
+    data_capture = private_home / "crush-global-data"
+    git_capture = private_home / "crush-git-scope"
+    author_capture = private_home / "crush-author"
+    monkeypatch.setenv("TEST_CAPTURE", str(capture))
+    monkeypatch.setenv("TEST_ARGS_CAPTURE", str(args_capture))
+    monkeypatch.setenv("TEST_DATA_CAPTURE", str(data_capture))
+    monkeypatch.setenv("TEST_GIT_CAPTURE", str(git_capture))
+    monkeypatch.setenv("TEST_AUTHOR_CAPTURE", str(author_capture))
+    monkeypatch.setenv("OPENAI_API_KEY", "fake-cloud-key")
+    with patch("rapid_mlx.agents.isolated._cli_invocation", return_value=str(rapid)):
+        isolated.configure("crush", "qwen3.5-9b-4bit", port=7660)
+    config = json.loads(
+        (isolated.connection_dir() / "agents/crush/crush.json").read_text()
+    )
+    assert config["models"]["large"]["provider"] == "rapid-mlx"
+    assert config["models"]["small"]["provider"] == "rapid-mlx"
+    assert config["models"]["small"]["model"] == "qwen3.5-9b-4bit"
+    assert config["options"]["disable_default_providers"] is True
+    runner = isolated.connection_dir() / "agents" / "crush" / "run"
+    assert (
+        str(isolated.connection_dir() / "agents/crush/bin/crush-launch")
+        in runner.read_text()
+    )
+    monkeypatch.setenv("GIT_DIR", str(private_home / "wrong-repo"))
+    monkeypatch.setenv("GIT_AUTHOR_NAME", "Current Author")
+    subprocess.run(["/bin/sh", str(runner)], check=True)
+    assert git_capture.read_text() == ""
+    assert author_capture.read_text() == "Current Author"
+    assert capture.read_text() == str(isolated.connection_dir() / "agents/crush")
+    assert data_capture.read_text() == str(
+        isolated.connection_dir() / "agents/crush/global-data"
+    )
+    assert stat.S_IMODE(Path(data_capture.read_text()).stat().st_mode) == 0o700
+    args = args_capture.read_text().splitlines()
+    project_id = hashlib.sha256(str(Path.cwd().resolve()).encode()).hexdigest()[:24]
+    assert args[args.index("--data-dir") + 1] == str(
+        isolated.connection_dir() / "agents/crush/data" / project_id
+    )
+    assert (
+        stat.S_IMODE(Path(args[args.index("--data-dir") + 1]).stat().st_mode) == 0o700
+    )
+    assert user_config.read_bytes() == original
+
+
+def test_crush_isolated_launch_rejects_project_config_override(
+    private_home, monkeypatch
+):
+    project = private_home / "project" / "nested"
+    project.mkdir(parents=True)
+    subprocess.run(["git", "init", "-q", str(project.parent)], check=True)
+    cloud_config = project.parent / ".crush.json"
+    cloud_config.write_text('{"models":{"large":{"provider":"cloud","model":"cloud"}}}')
+    monkeypatch.chdir(project)
+    monkeypatch.setenv("GIT_DIR", str(private_home / "wrong-repo"))
+    monkeypatch.setenv("GIT_WORK_TREE", str(private_home / "wrong-tree"))
+    with pytest.raises(ValueError, match="project configuration"):
+        isolated.configure("crush", "qwen3.5-9b-4bit", port=7660)
+    assert cloud_config.read_text().startswith('{"models"')
+
+
+def test_crush_ignores_config_above_project_and_resets_saved_model(
+    private_home, monkeypatch
+):
+    project = private_home / "project"
+    project.mkdir()
+    subprocess.run(["git", "init", "-q", str(project)], check=True)
+    (private_home / "crush.json").write_text('{"models":{"large":{"model":"cloud"}}}')
+    monkeypatch.chdir(project)
+    isolated.configure("crush", "qwen3.5-9b-4bit", port=7660)
+    root = isolated.connection_dir() / "agents" / "crush"
+    project_id = hashlib.sha256(str(project.resolve()).encode()).hexdigest()[:24]
+    data = root / "data" / project_id
+    assert stat.S_IMODE(data.stat().st_mode) == 0o700
+    stale = {
+        "models": {
+            "large": {"model": "cloud", "provider": "cloud", "temperature": 0.4},
+            "small": {"model": "cloud-small", "provider": "cloud", "max_tokens": 2048},
+        },
+        "providers": {"cloud": {"api_key": "fake"}},
+        "options": {
+            "data_directory": "/tmp/remote",
+            "disable_default_providers": False,
+            "compact_mode": True,
+        },
+        "theme": "dark",
+    }
+    (data / "crush.json").write_text(json.dumps(stale))
+    (data / "crush.db").write_text("history")
+    global_data = root / "global-data"
+    global_data.mkdir(exist_ok=True)
+    (global_data / "crush.json").write_text(json.dumps(stale))
+    isolated.configure("crush", "qwen3.5-9b-4bit", port=7660)
+    for saved in (data / "crush.json", global_data / "crush.json"):
+        assert json.loads(saved.read_text()) == {
+            "models": {
+                "large": {
+                    "provider": "rapid-mlx",
+                    "model": "qwen3.5-9b-4bit",
+                    "temperature": 0.4,
+                },
+                "small": {
+                    "provider": "rapid-mlx",
+                    "model": "qwen3.5-9b-4bit",
+                    "max_tokens": 2048,
+                },
+            },
+            "options": {"compact_mode": True},
+            "theme": "dark",
+        }
+    assert (data / "crush.db").read_text() == "history"
+
+
+def test_crush_rejects_invalid_saved_config(private_home, monkeypatch):
+    project = private_home / "project"
+    project.mkdir()
+    monkeypatch.chdir(project)
+    isolated.configure("crush", "qwen3.5-9b-4bit", port=7660)
+    saved = (
+        isolated.connection_dir() / "agents" / "crush" / "global-data" / "crush.json"
+    )
+    saved.parent.mkdir(parents=True, exist_ok=True)
+    saved.write_text('{"models": ["cloud"], "theme": "dark"}')
+    isolated.configure("crush", "qwen3.5-9b-4bit", port=7660)
+    pinned = {
+        slot: {"provider": "rapid-mlx", "model": "qwen3.5-9b-4bit"}
+        for slot in ("large", "small")
+    }
+    assert json.loads(saved.read_text()) == {"models": pinned, "theme": "dark"}
+    saved.write_text('{"models": {"large": {}}, "theme": "dark"}')
+    isolated.configure("crush", "qwen3.5-9b-4bit", port=7660)
+    assert json.loads(saved.read_text()) == {"models": pinned, "theme": "dark"}
+    saved.write_text("[]")
+    with pytest.raises(ValueError, match="saved configuration"):
+        isolated.configure("crush", "qwen3.5-9b-4bit", port=7660)
+    saved.write_text("{")
+    with pytest.raises(ValueError, match="saved configuration.*crush.json"):
+        isolated.configure("crush", "qwen3.5-9b-4bit", port=7660)
+
+
+def test_crush_data_is_separate_for_each_project(private_home, monkeypatch):
+    projects = [private_home / "a", private_home / "b"]
+    for project in projects:
+        project.mkdir()
+    commands = private_home / "commands"
+    commands.mkdir()
+    rapid = commands / "rapid-mlx"
+    rapid.write_text("#!/bin/sh\nexit 0\n")
+    rapid.chmod(0o700)
+    crush = commands / "crush"
+    crush.write_text('#!/bin/sh\nprintf "%s\\n" "$@" > "$TEST_ARGS_CAPTURE"\n')
+    crush.chmod(0o700)
+    monkeypatch.setenv("PATH", f"{commands}:{os.environ['PATH']}")
+    monkeypatch.chdir(projects[0])
+    with patch("rapid_mlx.agents.isolated._cli_invocation", return_value=str(rapid)):
+        isolated.configure("crush", "qwen3.5-9b-4bit", port=7660)
+    runner = isolated.connection_dir() / "agents/crush/run"
+    marker = private_home / "imported-project-module"
+    (projects[1] / "hashlib.py").write_text(
+        f"from pathlib import Path\nPath({str(marker)!r}).write_text('bad')\n"
+    )
+    captured = []
+    for project in projects:
+        args_capture = private_home / f"{project.name}-args"
+        monkeypatch.setenv("TEST_ARGS_CAPTURE", str(args_capture))
+        subprocess.run(["/bin/sh", str(runner)], cwd=project, check=True)
+        args = args_capture.read_text().splitlines()
+        captured.append(args[args.index("--data-dir") + 1])
+    assert captured[0] != captured[1]
+    assert not marker.exists()
+    for project, data_dir in zip(projects, captured):
+        project_id = hashlib.sha256(str(project.resolve()).encode()).hexdigest()[:24]
+        assert data_dir == str(
+            isolated.connection_dir() / "agents/crush/data" / project_id
+        )
+
+
+@pytest.mark.parametrize("agent", ("crush", "aider"))
+def test_private_helper_handles_spaced_interpreter_path(
+    private_home, monkeypatch, agent
+):
+    project = private_home / "project"
+    project.mkdir()
+    monkeypatch.chdir(project)
+    commands = private_home / "commands"
+    commands.mkdir()
+    rapid = commands / "rapid-mlx"
+    rapid.write_text("#!/bin/sh\nexit 0\n")
+    rapid.chmod(0o700)
+    capture = private_home / "launched"
+    client = commands / agent
+    client.write_text(f'#!/bin/sh\nprintf launched > "{capture}"\n')
+    client.chmod(0o700)
+    monkeypatch.setenv("PATH", f"{commands}:{os.environ['PATH']}")
+    interpreter_dir = private_home / "Application Support"
+    interpreter_dir.mkdir()
+    interpreter = interpreter_dir / "python3"
+    interpreter.symlink_to(sys.executable)
+    with (
+        patch("rapid_mlx.agents.isolated._cli_invocation", return_value=str(rapid)),
+        patch("rapid_mlx.agents.isolated.sys.executable", str(interpreter)),
+    ):
+        isolated.configure(agent, "qwen3.5-9b-4bit", port=7660)
+    runner = isolated.connection_dir() / "agents" / agent / "run"
+    subprocess.run(["/bin/sh", str(runner)], check=True)
+    assert capture.read_text() == "launched"
+
+
+def test_aider_runner_ignores_existing_cloud_config(private_home, monkeypatch):
+    user_config = private_home / ".aider.conf.yml"
+    original = b"model: openai/cloud\nopenai-api-key: fake-cloud-key\n"
+    user_config.write_bytes(original)
+    (private_home / ".gitconfig").write_text("[user]\n  name = Real Developer\n")
+    commands = private_home / "commands"
+    commands.mkdir()
+    rapid = commands / "rapid-mlx"
+    rapid.write_text("#!/bin/sh\nexit 0\n")
+    rapid.chmod(0o700)
+    args_capture = private_home / "aider-args"
+    env_capture = private_home / "aider-env"
+    git_capture = private_home / "aider-git-name"
+    aider = commands / "aider"
+    aider.write_text(
+        f'#!/bin/sh\nprintf "%s\\n" "$@" > "{args_capture}"\n'
+        f'printf "%s\\n%s\\n%s\\n%s\\n" "$AIDER_OPENAI_API_KEY" "$AIDER_OPENAI_API_BASE" "$HOME" "$AIDER_MODEL_SETTINGS_FILE" > "{env_capture}"\n'
+        f'git config user.name > "{git_capture}"\n'
+    )
+    aider.chmod(0o700)
+    monkeypatch.setenv("PATH", f"{commands}:{os.environ['PATH']}")
+    monkeypatch.setenv("AIDER_OPENAI_API_KEY", "fake-cloud-key")
+    monkeypatch.setenv("AIDER_OPENAI_API_BASE", "https://cloud.invalid/v1")
+    monkeypatch.setenv("AIDER_MODEL_SETTINGS_FILE", "cloud-models.yml")
+    with patch("rapid_mlx.agents.isolated._cli_invocation", return_value=str(rapid)):
+        isolated.configure("aider", "qwen3.5-9b-4bit", port=7660)
+    runner = isolated.connection_dir() / "agents/aider/run"
+    subprocess.run([shutil.which("zsh") or "/bin/bash", str(runner)], check=True)
+    args = args_capture.read_text().splitlines()
+    assert args[args.index("--config") + 1] == str(
+        isolated.connection_dir() / "agents/aider/aider.conf.yml"
+    )
+    assert args[args.index("--openai-api-base") + 1] == "http://127.0.0.1:7660/v1"
+    assert args[args.index("--weak-model") + 1] == "openai/qwen3.5-9b-4bit"
+    assert args[args.index("--editor-model") + 1] == "openai/qwen3.5-9b-4bit"
+    assert env_capture.read_text().splitlines() == [
+        isolated.key_path().read_text().strip(),
+        "http://127.0.0.1:7660/v1",
+        str(isolated.connection_dir() / "agents/aider/home"),
+        "",
+    ]
+    assert git_capture.read_text().strip() == "Real Developer"
+    assert (
+        isolated.connection_dir() / "agents/aider/aider.conf.yml"
+    ).read_text() == "{}\n"
+    private_env = (isolated.connection_dir() / "agents/aider/aider.env").read_text()
+    assert (
+        f"AIDER_OPENAI_API_KEY={isolated.key_path().read_text().strip()}" in private_env
+    )
+    assert "AIDER_OPENAI_API_BASE=http://127.0.0.1:7660/v1" in private_env
+    assert user_config.read_bytes() == original
+
+
+def test_aider_rejects_project_configuration_before_writing_state(
+    private_home, monkeypatch
+):
+    project = private_home / "project"
+    project.mkdir()
+    config = project / ".aider.conf.yml"
+    config.write_text("yes-always: true\n")
+    monkeypatch.chdir(project)
+    with pytest.raises(ValueError, match="project configuration"):
+        isolated.configure("aider", "qwen3.5-9b-4bit", port=7660)
+    assert config.read_text() == "yes-always: true\n"
+    config.unlink()
+    (project / ".env").write_text("AIDER_MODEL_SETTINGS_FILE=cloud-models.yml\n")
+    with pytest.raises(ValueError, match="project configuration"):
+        isolated.configure("aider", "qwen3.5-9b-4bit", port=7660)
+
+
+def test_aider_git_shim_preserves_environment_only_commit_identity(
+    private_home, monkeypatch
+):
+    project = private_home / "project"
+    project.mkdir()
+    subprocess.run(["git", "init", "-q", str(project)], check=True)
+    commands = private_home / "commands"
+    commands.mkdir()
+    rapid = commands / "rapid-mlx"
+    rapid.write_text("#!/bin/sh\nexit 0\n")
+    rapid.chmod(0o700)
+    aider = commands / "aider"
+    aider.write_text("#!/bin/sh\ngit commit --allow-empty -m local-edit\n")
+    aider.chmod(0o700)
+    monkeypatch.setenv("PATH", f"{commands}:{os.environ['PATH']}")
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", os.devnull)
+    monkeypatch.setenv("GIT_AUTHOR_NAME", "Environment Author")
+    monkeypatch.setenv("GIT_AUTHOR_EMAIL", "author@example.invalid")
+    monkeypatch.setenv("GIT_COMMITTER_NAME", "Environment Committer")
+    monkeypatch.setenv("GIT_COMMITTER_EMAIL", "committer@example.invalid")
+    monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
+    monkeypatch.setenv("GIT_CONFIG_KEY_0", "rapidmlxtest.empty")
+    monkeypatch.setenv("GIT_CONFIG_VALUE_0", "")
+    monkeypatch.setenv("GIT_DIR", str(private_home / "wrong-repo"))
+    monkeypatch.setenv("GIT_WORK_TREE", str(private_home / "wrong-tree"))
+    monkeypatch.setenv("GIT_INDEX_FILE", str(private_home / "wrong-index"))
+    monkeypatch.setenv("GIT_BAD-NAME", "should-not-enter-a-shell-script")
+    monkeypatch.chdir(project)
+    with patch("rapid_mlx.agents.isolated._cli_invocation", return_value=str(rapid)):
+        isolated.configure("aider", "qwen3.5-9b-4bit", port=7660)
+    runner = isolated.connection_dir() / "agents/aider/run"
+    assert (
+        "should-not-enter-a-shell-script"
+        not in (isolated.connection_dir() / "agents/aider/bin/git").read_text()
+    )
+    assert (
+        "Environment Author"
+        not in (isolated.connection_dir() / "agents/aider/bin/git").read_text()
+    )
+    assert (
+        "GIT_DIR="
+        not in (isolated.connection_dir() / "agents/aider/bin/git").read_text()
+    )
+    assert (
+        "GIT_WORK_TREE="
+        not in (isolated.connection_dir() / "agents/aider/bin/git").read_text()
+    )
+    assert (
+        "GIT_INDEX_FILE="
+        not in (isolated.connection_dir() / "agents/aider/bin/git").read_text()
+    )
+    monkeypatch.setenv("GIT_AUTHOR_NAME", "Current Author")
+    subprocess.run([shutil.which("zsh") or "/bin/bash", str(runner)], check=True)
+    for variable in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE"):
+        monkeypatch.delenv(variable)
+    commit = subprocess.check_output(
+        ["git", "log", "-1", "--format=%an <%ae>|%cn <%ce>"], cwd=project, text=True
+    ).strip()
+    assert commit == (
+        "Current Author <author@example.invalid>|"
+        "Environment Committer <committer@example.invalid>"
+    )
+
+
+def test_aider_rejects_existing_home_config_from_home_directory(
+    private_home, monkeypatch
+):
+    config = private_home / ".aider.conf.yml"
+    config.write_text("model: cloud\n")
+    (private_home / ".aider.model.settings.yml").write_text("- name: cloud\n")
+    (private_home / ".env").write_text("OPENAI_API_BASE=https://cloud.invalid\n")
+    monkeypatch.chdir(private_home)
+    with pytest.raises(ValueError, match="project configuration"):
+        isolated.configure("aider", "qwen3.5-9b-4bit", port=7660)
+    assert config.read_text() == "model: cloud\n"
+    assert not isolated.connection_dir().exists()
+
+
+def test_aider_rejects_home_git_root_config_from_subdirectory(
+    private_home, monkeypatch
+):
+    subprocess.run(["git", "init", "-q", str(private_home)], check=True)
+    (private_home / ".aider.model.settings.yml").write_text("- name: cloud\n")
+    project = private_home / "project"
+    project.mkdir()
+    monkeypatch.chdir(project)
+    monkeypatch.setenv("GIT_DIR", str(private_home / "wrong-repo"))
+    monkeypatch.setenv("GIT_WORK_TREE", str(private_home / "wrong-tree"))
+    with pytest.raises(ValueError, match="project configuration"):
+        isolated.configure("aider", "qwen3.5-9b-4bit", port=7660)
+
+
+def test_aider_requires_git_for_private_home_shim(private_home, monkeypatch):
+    monkeypatch.setattr("rapid_mlx.agents.isolated.shutil.which", lambda name: None)
+    with pytest.raises(ValueError, match="requires git"):
+        isolated.configure("aider", "qwen3.5-9b-4bit", port=7660)
+    assert not isolated.connection_dir().exists()
+
+
+@pytest.mark.parametrize(
+    ("agent", "project_config"),
+    [("crush", ".crush.json"), ("aider", ".aider.conf.yml")],
+)
+def test_saved_runner_checks_new_working_directory_before_agent_starts(
+    private_home, monkeypatch, agent, project_config
+):
+    monkeypatch.setenv("HOME", str(private_home))
+    monkeypatch.setenv("PYTHONPATH", str(Path(__file__).resolve().parents[1]))
+    commands = private_home / "commands"
+    commands.mkdir()
+    rapid = commands / "rapid-mlx"
+    rapid.write_text(
+        f"#!{sys.executable}\n"
+        "import sys\n"
+        "if '--check' not in sys.argv:\n"
+        "    from rapid_mlx.agents import isolated\n"
+        "    isolated.configure(sys.argv[2], 'qwen3.5-9b-4bit', port=7660)\n"
+    )
+    rapid.chmod(0o700)
+    marker = private_home / "agent-started"
+    client = commands / agent
+    client.write_text(f'#!/bin/sh\ntouch "{marker}"\n')
+    client.chmod(0o700)
+    monkeypatch.setenv("PATH", f"{commands}:{os.environ['PATH']}")
+    first = private_home / "first"
+    second = private_home / "second"
+    first.mkdir()
+    second.mkdir()
+    monkeypatch.chdir(first)
+    with patch("rapid_mlx.agents.isolated._cli_invocation", return_value=str(rapid)):
+        isolated.configure(agent, "qwen3.5-9b-4bit", port=7660)
+    runner = isolated.connection_dir() / "agents" / agent / "run"
+    unsafe = second / project_config
+    unsafe.write_text("cloud override\n")
+    result = subprocess.run(
+        [shutil.which("zsh") or "/bin/bash", str(runner)],
+        cwd=second,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode != 0
+    assert not marker.exists()
+    assert unsafe.read_text() == "cloud override\n"
+    if agent == "crush":
+        unsafe.unlink()
+        project_id = hashlib.sha256(str(second.resolve()).encode()).hexdigest()[:24]
+        saved = (
+            isolated.connection_dir()
+            / "agents"
+            / "crush"
+            / "data"
+            / project_id
+            / "crush.json"
+        )
+        saved.parent.mkdir(parents=True)
+        saved.write_text('{"models":{"large":{"model":"cloud","provider":"cloud"}}}')
+        result = subprocess.run(
+            [shutil.which("zsh") or "/bin/bash", str(runner)],
+            cwd=second,
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0, result.stderr
+        assert marker.exists()
+        assert json.loads(saved.read_text())["models"]["large"] == {
+            "provider": "rapid-mlx",
+            "model": "qwen3.5-9b-4bit",
+        }
