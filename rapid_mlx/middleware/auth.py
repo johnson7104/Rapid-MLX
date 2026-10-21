@@ -191,21 +191,27 @@ def _subnet_bucket(host: str) -> str:
 
 
 def _rate_limit_client_id(request: Request) -> str:
-    """Resolve the default client id for rate limiting."""
-    authorization = request.headers.get("Authorization")
-    if authorization:
-        bearer_key = _extract_bearer_token(authorization)
-        if bearer_key is not None:
+    """Bucket verified credentials separately; use the subnet otherwise."""
+    configured_key = get_config().api_key
+
+    def matches(candidate: str | None) -> bool:
+        if not configured_key or not candidate:
+            return False
+        try:
+            return secrets.compare_digest(candidate, configured_key)
+        except TypeError:
+            return False
+
+    authorization_headers = request.headers.getlist("Authorization")
+    if len(authorization_headers) == 1:
+        bearer_key = _extract_bearer_token(authorization_headers[0])
+        if matches(bearer_key):
+            assert bearer_key is not None
             return _bucket_id(bearer_key)
-        # A recognized ``Bearer`` scheme carrying an empty / whitespace-only
-        # token is not a real credential — fall through to subnet/unknown
-        # bucketing so a client can't mint a fresh rate-limit bucket per
-        # request by padding the header with varying whitespace (#1291). A
-        # non-Bearer scheme (e.g. ``Basic``) still buckets by the raw header
-        # so it keeps a stable per-credential identity.
-        scheme = authorization.split(" ", 1)[0].lower()
-        if scheme != "bearer":
-            return _bucket_id(authorization)
+
+    x_api_keys = request.headers.getlist("x-api-key")
+    if x_api_keys and all(matches(candidate) for candidate in x_api_keys):
+        return _bucket_id(x_api_keys[0])
 
     if request.client and request.client.host:
         return _subnet_bucket(request.client.host)
@@ -213,18 +219,8 @@ def _rate_limit_client_id(request: Request) -> str:
 
 
 def _anthropic_rate_limit_client_id(request: Request) -> str:
-    """Resolve a stable client id for Anthropic-compatible API-key headers."""
-    bearer_key = _extract_bearer_token(request.headers.get("Authorization"))
-    if bearer_key:
-        return _bucket_id(bearer_key)
-
-    x_api_key = request.headers.get("x-api-key")
-    if x_api_key:
-        return _bucket_id(x_api_key)
-
-    if request.client and request.client.host:
-        return _subnet_bucket(request.client.host)
-    return "unknown"
+    """Use the same verified identity for compatibility routes."""
+    return _rate_limit_client_id(request)
 
 
 async def check_rate_limit(request: Request):
@@ -295,29 +291,35 @@ def _verify_api_key_values(*api_keys: str | None) -> bool:
     return True
 
 
-async def verify_api_key(credentials: HTTPAuthorizationCredentials = Depends(security)):
-    """Verify API key if authentication is enabled."""
+async def verify_api_key(
+    request: Request,
+    credentials: HTTPAuthorizationCredentials | None = Depends(security),
+):
+    """Verify Bearer or Anthropic-style API key if authentication is enabled."""
     bearer_key = credentials.credentials if credentials is not None else None
-    return _verify_api_key_values(bearer_key)
+    authorization_headers = request.headers.getlist("authorization")
+    if len(authorization_headers) > 1 or (authorization_headers and bearer_key is None):
+        # HTTPBearer reads only the first value and maps malformed values
+        # to None. Reject every ambiguous or invalid companion header.
+        bearer_key = ""
+    x_api_keys = request.headers.getlist("x-api-key")
+    return _verify_api_key_values(bearer_key, *x_api_keys)
 
 
 async def verify_api_key_for_scope(scope) -> bool:
     """Run the bearer check against a raw ASGI scope without reading its body."""
     credentials = await security(Request(scope))
     bearer_key = credentials.credentials if credentials is not None else None
-    return _verify_api_key_values(bearer_key)
+    request = Request(scope)
+    authorization_headers = request.headers.getlist("authorization")
+    if len(authorization_headers) > 1 or (authorization_headers and bearer_key is None):
+        bearer_key = ""
+    return _verify_api_key_values(bearer_key, *request.headers.getlist("x-api-key"))
 
 
 async def verify_api_key_or_x_api_key(
     request: Request,
     credentials: HTTPAuthorizationCredentials = Depends(security),
 ):
-    """Verify OpenAI Bearer auth or Anthropic x-api-key auth."""
-    bearer_key = credentials.credentials if credentials is not None else None
-    # ``getlist`` so a duplicated ``x-api-key`` header can't smuggle an invalid
-    # value past the gate alongside a valid twin — every present value is
-    # verified, extending the "both must match" rule to multi-valued headers
-    # (#337). An absent header yields ``[]`` (nothing added), while a present
-    # empty header yields ``[""]`` and is checked as a supplied credential.
-    x_api_keys = request.headers.getlist("x-api-key")
-    return _verify_api_key_values(bearer_key, *x_api_keys)
+    """Compatibility alias for routes already using the dual-header gate."""
+    return await verify_api_key(request, credentials)

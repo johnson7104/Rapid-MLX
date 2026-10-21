@@ -10,7 +10,7 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
-from fastapi import Depends, FastAPI
+from fastapi import Depends, FastAPI, HTTPException
 from fastapi.testclient import TestClient
 
 
@@ -720,11 +720,22 @@ def test_anthropic_count_tokens_rate_limit_treats_header_forms_as_same_key(
     assert second.json()["detail"].startswith("Rate limit exceeded.")
 
 
-def test_shared_rate_limit_ignores_x_api_key_for_non_anthropic_routes(
-    anthropic_client,
+@pytest.mark.parametrize("configured_key", [None, "test-secret"])
+@pytest.mark.parametrize(
+    ("header", "first_value", "second_value"),
+    [
+        ("x-api-key", "one", "two"),
+        ("Authorization", "Bearer one", "Bearer two"),
+        ("Authorization", "Basic one", "Basic two"),
+    ],
+)
+def test_shared_rate_limit_ignores_unverified_credentials_for_standard_routes(
+    anthropic_client, configured_key, header, first_value, second_value
 ):
+    from rapid_mlx.config import get_config
     from rapid_mlx.middleware.auth import check_rate_limit
 
+    get_config().api_key = configured_key
     anthropic_client.rate_limiter.enabled = True
     anthropic_client.rate_limiter.requests_per_minute = 1
 
@@ -735,12 +746,88 @@ def test_shared_rate_limit_ignores_x_api_key_for_non_anthropic_routes(
         return {"ok": True}
 
     client = TestClient(app)
-    first = client.get("/test", headers={"x-api-key": "one"})
-    second = client.get("/test", headers={"x-api-key": "two"})
+    first = client.get("/test", headers={header: first_value})
+    second = client.get("/test", headers={header: second_value})
 
     assert first.status_code == 200
     assert second.status_code == 429
-    assert second.json()["detail"].startswith("Rate limit exceeded.")
+
+
+def test_public_anthropic_rate_limit_ignores_rotated_api_keys(anthropic_client):
+    from rapid_mlx.config import get_config
+
+    get_config().api_key = None
+    anthropic_client.rate_limiter.enabled = True
+    anthropic_client.rate_limiter.requests_per_minute = 1
+    first = anthropic_client.client.post(
+        "/v1/messages", json=_messages_payload(), headers={"x-api-key": "one"}
+    )
+    second = anthropic_client.client.post(
+        "/v1/messages", json=_messages_payload(), headers={"x-api-key": "two"}
+    )
+    assert first.status_code == 200
+    assert second.status_code == 429
+
+
+def test_shared_rate_limit_ignores_non_ascii_key(anthropic_client):
+    from fastapi import Request
+
+    from rapid_mlx.middleware.auth import _rate_limit_client_id
+
+    request = Request(
+        {
+            "type": "http",
+            "headers": [(b"x-api-key", b"\xff")],
+            "client": ("127.0.0.1", 1234),
+        }
+    )
+    assert _rate_limit_client_id(request) == "127.0.0.0"
+
+
+def test_duplicate_valid_api_keys_share_rate_limit_bucket(anthropic_client):
+    from rapid_mlx.config import get_config
+    from rapid_mlx.middleware.auth import check_rate_limit, verify_api_key
+
+    get_config().api_key = "test-secret"
+    anthropic_client.rate_limiter.enabled = True
+    anthropic_client.rate_limiter.requests_per_minute = 1
+    app = FastAPI()
+
+    @app.get("/test", dependencies=[Depends(verify_api_key), Depends(check_rate_limit)])
+    async def test_endpoint():
+        return {"ok": True}
+
+    client = TestClient(app)
+    first = client.get("/test", headers={"x-api-key": "test-secret"})
+    second = client.get(
+        "/test",
+        headers=[("x-api-key", "test-secret"), ("x-api-key", "test-secret")],
+    )
+
+    assert first.status_code == 200
+    assert second.status_code == 429
+
+
+def test_shared_rate_limit_uses_x_api_key_before_unsupported_auth(anthropic_client):
+    from rapid_mlx.middleware.auth import check_rate_limit
+
+    anthropic_client.rate_limiter.enabled = True
+    anthropic_client.rate_limiter.requests_per_minute = 1
+    app = FastAPI()
+
+    @app.get("/test", dependencies=[Depends(check_rate_limit)])
+    async def test_endpoint():
+        return {"ok": True}
+
+    client = TestClient(app)
+    first = client.get(
+        "/test", headers={"x-api-key": "test-secret", "Authorization": "Basic one"}
+    )
+    second = client.get(
+        "/test", headers={"x-api-key": "test-secret", "Authorization": "Basic two"}
+    )
+    assert first.status_code == 200
+    assert second.status_code == 429
 
 
 def test_shared_rate_limit_uses_same_bearer_identity_for_anthropic_and_standard_routes(
@@ -785,7 +872,7 @@ def test_shared_rate_limit_uses_same_bearer_identity_for_anthropic_and_standard_
     assert second.json()["detail"].startswith("Rate limit exceeded.")
 
 
-def test_shared_auth_rejects_x_api_key_for_non_anthropic_routes(
+def test_shared_auth_accepts_x_api_key_for_standard_routes(
     anthropic_client,
 ):
     from rapid_mlx.middleware.auth import verify_api_key
@@ -800,9 +887,51 @@ def test_shared_auth_rejects_x_api_key_for_non_anthropic_routes(
     x_api_key_only = client.get("/test", headers={"x-api-key": "test-secret"})
     bearer = client.get("/test", headers={"Authorization": "Bearer test-secret"})
 
-    assert x_api_key_only.status_code == 401
-    assert x_api_key_only.json()["detail"] == "API key required"
+    assert x_api_key_only.status_code == 200
     assert bearer.status_code == 200
+    mixed = client.get(
+        "/test",
+        headers={"Authorization": "Bearer wrong", "x-api-key": "test-secret"},
+    )
+    assert mixed.status_code == 401
+    for authorization in ("Bearer", "Basic arbitrary"):
+        mixed = client.get(
+            "/test",
+            headers={"Authorization": authorization, "x-api-key": "test-secret"},
+        )
+        assert mixed.status_code == 401
+    duplicate = client.get(
+        "/test",
+        headers=[
+            ("Authorization", "Bearer test-secret"),
+            ("Authorization", "Bearer wrong"),
+            ("x-api-key", "test-secret"),
+        ],
+    )
+    assert duplicate.status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_scope_auth_accepts_x_api_key_and_rejects_duplicate_bearer(
+    anthropic_client,
+):
+    from rapid_mlx.middleware.auth import verify_api_key_for_scope
+
+    scope = {
+        "type": "http",
+        "method": "GET",
+        "path": "/v1/models",
+        "headers": [(b"x-api-key", b"test-secret")],
+    }
+    assert await verify_api_key_for_scope(scope)
+    scope["headers"] = [
+        (b"authorization", b"Bearer test-secret"),
+        (b"authorization", b"Bearer wrong"),
+        (b"x-api-key", b"test-secret"),
+    ]
+    with pytest.raises(HTTPException) as exc_info:
+        await verify_api_key_for_scope(scope)
+    assert exc_info.value.status_code == 401
 
 
 def test_configure_rate_limiter_updates_shared_anthropic_dependency(
