@@ -135,6 +135,23 @@ def test_init_mcp_with_missing_file_does_not_raise(client, tmp_path):
     assert client.get("/healthz").status_code == 200
 
 
+def test_init_mcp_missing_yaml_preserves_active_python_install_hint(
+    client, monkeypatch, tmp_path
+):
+    import sys
+
+    from rapid_mlx.connect import package_install_command
+
+    path = tmp_path / "mcp.yaml"
+    path.write_text("mcpServers: {}")
+    monkeypatch.setitem(sys.modules, "yaml", None)
+    asyncio.run(server_module.init_mcp(str(path)))
+
+    body = client.get("/v1/mcp/servers").json()
+    assert package_install_command("pyyaml") in body["error"]
+    assert "MCP SDK not installed" not in body["error"]
+
+
 def test_init_mcp_with_malformed_json_does_not_raise(client, tmp_path):
     path = tmp_path / "mcp.json"
     path.write_text("{ this is not json")

@@ -87,8 +87,12 @@ def load_mcp_config(
 
             data = yaml.safe_load(content)
         except ImportError:
-            raise ImportError(
-                "PyYAML required for .yaml config files: pip install pyyaml"
+            from rapid_mlx.connect import package_install_command
+
+            raise ModuleNotFoundError(
+                "PyYAML required for .yaml config files: "
+                f"{package_install_command('pyyaml')}",
+                name="yaml",
             )
     else:
         data = json.loads(content)
