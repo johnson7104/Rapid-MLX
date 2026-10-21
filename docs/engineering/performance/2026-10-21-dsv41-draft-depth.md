@@ -1,7 +1,7 @@
 # DeepSeek V4.1 draft depth and timing
 
 `RAPID_MLX_DSV41_DRAFT_DEPTH` accepts `0`, `1`, `2`, `3`, `4`, or
-`auto`. The default is `4`; invalid values log a warning and use `4`.
+`auto`. The default is `2`; invalid values log a warning and use `2`.
 The setting is read at request start. Fixed depths are explicit overrides:
 `0` skips draft execution and context projection, and `4` retains the previous
 seed-plus-four verification width. All positive depths retain all five draft
@@ -24,6 +24,27 @@ gain over the current choice; an unprofitable current depth is discarded
 immediately. After 32 completed plain steps at K=0, two consecutive rounds probe
 at maximum depth, even if the first probe changes the preferred rate. The output
 budget and cache rings cap all choices, including warm-up and probes.
+
+## Measured defaults
+
+Environment: M3 Ultra 256 GB, v2 checkpoint revision `c521050a`, server single
+stream. Results are per-stream decode tok/s with 256 max tokens, greedy decoding,
+and 1 warm-up + 2 measured rounds. Prompts include the 1008-token summarisation
+prompt `p1008` plus `qa`, `summarize`, `code`, and `structured` chat prompts.
+
+| Depth | p1008 | qa | summarize | code | structured |
+| --- | --- | --- | --- | --- | --- |
+| 2 | 35.2 | 34.3 | 36.2 | 42.7 | 42.1 |
+| 4 | 31.2 | 33.1 | 33.6 | 49.0 | 46.5 |
+| auto | 31.2 | 31.1 | 32.0 | 49.1 | 47.0 |
+
+Depth 2 is the default because it is the best single setting across prompt
+classes. It leads on `p1008`, `qa`, and `summarize`, while depth 4 and auto are
+faster on `code` and `structured`. Auto remains opt-in.
+
+Draft cost per round fell from 19.6 ms before this change set to 10.1 ms; the
+head share fell from 8.8 ms to 2.1 ms. Acceptance histograms were unchanged
+versus the stock draft path.
 
 ## Cost provenance and online learning
 
@@ -63,8 +84,8 @@ For independent Metal recalibration, prefill a representative prompt once,
 verify a fixed token sequence of each width with rollback to the original offset
 after each call, warm each width three times, and record twelve synchronized
 elapsed times. Retain hardware, context length, methodology and the measured
-curve with the results. The environment default stays at 4 pending deployment
-Metal measurements.
+curve with the results. The environment default is 2 based on the server
+measurements above.
 
 This policy estimates steady-state throughput. Fixed overrides, acceptance
 changes, calibration error, startup, short requests, and periodic probes can
@@ -95,7 +116,31 @@ Phase sums therefore measure isolated work and cannot quantify serving overlap.
 
 The proposal fixtures in `test_deepseek_v41_draft_numerics.py` record the
 pre-change proposal IDs at commit `59460430b8dd951a684a946b25e807ae33ce8350`
-for three deterministic CPU fixtures. CPU tests require exact proposal prefixes
-and exact greedy tokens at every depth and in auto mode. Metal performance and
+for three deterministic CPU fixtures. Stock draft CPU tests require exact proposal prefixes; optimized draft tests
+require finite proposals and exact greedy output tokens. Output tokens must
+match at every depth and in auto mode. Metal performance and
 token equality require the deployment hardware run; CPU timings do not establish
 the 5 ms draft target.
+
+## Stage A2: acceptance-qualified draft kernels
+
+The fused draft MoE and draft head GEMV are **acceptance-qualified, not
+bit-exact** against the batched stock draft. Supported layouts, dtypes, and row
+counts use the optimized kernels directly, without numerical equality probes.
+Draft rounding can change proposals and acceptance, but the target verification
+forward decides every emitted token. The target path and its exactness
+qualification remain unchanged. The correctness contract is token equality to
+draft-off greedy on the fixtures, rather than equality of draft proposals,
+logits, or confidence.
+
+Each optimized component records a device finite flag. These flags and the
+final draft logits are evaluated at the existing per-round verify boundary;
+checking them adds no host synchronization to successful rounds. A component
+that produces NaN/inf from finite input is permanently disabled independently
+of other layers and the head, with one WARNING identifying the layer/head and
+bit combination (head dtype). Non-finite values propagated from an earlier
+component do not disable downstream components. Before retrying a failed round,
+serving rolls back target cache offsets and restores overwritten window slots;
+the round is recomputed using the stock draft path for the failed component.
+Unsupported kernel layouts retain the stock draft path. Non-finite stock draft
+results still fail the request.
