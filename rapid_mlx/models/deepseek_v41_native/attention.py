@@ -35,12 +35,16 @@ _mlx_compat.install()
 
 from mlx_lm.models.mla import MultiLinear  # noqa: E402
 
+from . import decode_attention
 from .compressor import Compressor
 from .config import ModelArgs
-from .fakequant import fake_quant_fp4_e4m3, fake_quant_fp8_ue8m0
 from .indexer import Indexer
 from .layers import RMSNorm, precompute_freqs_cis, rope_tail
+from .rope_quant import rope_fake_quant
 from .sparse_attention import sparse_attn
+
+# Decode gathers only the selected compressed rows (False: concatenate all).
+GATHER_DECODE_ROWS = True
 
 
 class GroupedOutputLinear(MultiLinear):
@@ -72,6 +76,10 @@ def window_idx_matrix(wp: int, n: int, window: int) -> mx.array:
     return mx.where(idx > end[:, None], mx.array(-1, mx.int32), idx.astype(mx.int32))
 
 
+# Rope rows a table grows by once it passes this length (see Attention._freqs).
+_ROPE_TABLE_CHUNK = 4096
+
+
 class Attention(nn.Module):
     def __init__(self, layer_id: int, args: ModelArgs):
         super().__init__()
@@ -87,6 +95,7 @@ class Attention(nn.Module):
         self.ratio = args.compress_ratio(layer_id)
         self.eps = args.norm_eps
         self.softmax_scale = args.head_dim**-0.5
+        self.index_topk = args.index_topk
 
         self.attn_sink = mx.zeros((self.n_heads,), dtype=mx.float32)
         self.wq_a = nn.Linear(self.dim, self.q_lora_rank, bias=False)
@@ -134,9 +143,18 @@ class Attention(nn.Module):
 
     def _freqs(self, upto: int):
         if self._cos is None or self._cos.shape[0] < upto:
+            # Grow ahead of the position: an exact-length table would be
+            # rebuilt on every decode step. Each row depends only on its own
+            # position, so a longer table holds identical values. Doubling up
+            # to one chunk, then whole chunks, bounds the slack per layer.
+            size = 64
+            while size < upto and size < _ROPE_TABLE_CHUNK:
+                size *= 2
+            if size < upto:
+                size = -(-upto // _ROPE_TABLE_CHUNK) * _ROPE_TABLE_CHUNK
             rd, orig_len, theta, factor, bf, bs = self._rope
             self._cos, self._sin = precompute_freqs_cis(
-                rd, max(upto, 64), orig_len, theta, factor, bf, bs
+                rd, size, orig_len, theta, factor, bf, bs
             )
         return self._cos, self._sin
 
@@ -148,24 +166,32 @@ class Attention(nn.Module):
         cos, sin = self._freqs(end_pos)
         c_q, s_q = cos[start_pos:end_pos], sin[start_pos:end_pos]
 
-        # --- queries ---
+        lc = cache.layers[self.layer_id]
+        # queries and window KV (rope tail + FP8 fake-quant over the whole
+        # vector); the fused path applies the query rope inside its kernel
         qr = self.q_norm(self.wq_a(x))
         q = self.wq_b(qr).reshape(bsz, n, self.n_heads, self.head_dim)
-        q = rope_tail(q, rd, c_q, s_q)
-
-        # --- window KV: rope tail, FP8 fake-quant over the whole vector ---
-        kv = self.kv_norm(self.wkv(x))
-        kv = rope_tail(kv, rd, c_q, s_q)
-        kv = fake_quant_fp8_ue8m0(kv, 32)
-
-        lc = cache.layers[self.layer_id]
-        prev = lc.window_chrono(start_pos)  # [b, Wp, hd]
-        wp = prev.shape[1]
-        kv_all = mx.concatenate([prev.astype(kv.dtype), kv], axis=1) if wp else kv
-        idxs = mx.broadcast_to(
-            window_idx_matrix(wp, n, self.window_size)[None],
-            (bsz, n, min(self.window_size, wp + n)),
+        kv = rope_fake_quant(self.kv_norm(self.wkv(x)), rd, c_q, s_q, "fp8_ue8m0")
+        # The kernel rounds every key/value row to q's dtype, as the graph rounds
+        # them to kv's, and reads this token back through the ring: both are
+        # exact only when q and kv share a dtype the ring stores losslessly.
+        fused = (
+            not self._break_rope_inverse
+            and q.dtype == kv.dtype
+            and lc.win_kv.dtype in (kv.dtype, mx.float32)
+            and decode_attention.supports(x, lc.win_kv, self.n_heads, self.head_dim, rd)
         )
+        if fused:
+            wp = min(start_pos, self.window_size)
+        else:
+            q = rope_tail(q, rd, c_q, s_q)
+            prev = lc.window_chrono(start_pos)  # [b, Wp, hd]
+            wp = prev.shape[1]
+            kv_all = mx.concatenate([prev.astype(kv.dtype), kv], axis=1) if wp else kv
+            idxs = mx.broadcast_to(
+                window_idx_matrix(wp, n, self.window_size)[None],
+                (bsz, n, min(self.window_size, wp + n)),
+            )
         lc.write_window(start_pos, kv)
         offset = wp + n  # compressed entries follow
 
@@ -199,21 +225,51 @@ class Attention(nn.Module):
                 g0 = start_pos // self.ratio
                 g = latents.shape[1]
                 pos = (g0 + mx.arange(g)) * self.ratio  # group j at position j*ratio
-                latents = rope_tail(latents, rd, cos[pos], sin[pos])
-                latents = fake_quant_fp4_e4m3(latents, 16)
-                lc.comp_kv[:bsz, g0 : g0 + g] = latents.astype(lc.dtype)
+                lc.comp_kv[:bsz, g0 : g0 + g] = rope_fake_quant(
+                    latents, rd, cos[pos], sin[pos], "fp4_e4m3", lc.dtype
+                )
 
-            if compress_len:
-                comp = src.comp_kv[:bsz, :compress_len].astype(kv.dtype)
+            if compress_len and not fused:
+                k = cidx.shape[-1]
+                if GATHER_DECODE_ROWS and n == 1 and k < compress_len:
+                    # Decode reads only the k selected rows: gather them from
+                    # the cache instead of converting and concatenating all
+                    # compress_len rows on every step. Same rows, same casts.
+                    rows = mx.maximum(cidx[:, 0] - offset, 0)
+                    batch = mx.arange(bsz, dtype=mx.int32)[:, None]
+                    comp = src.comp_kv[batch, rows].astype(kv.dtype)
+                    local = offset + mx.arange(k, dtype=mx.int32)
+                    local = mx.where(cidx >= 0, local, mx.array(-1, mx.int32))
+                else:
+                    comp = src.comp_kv[:bsz, :compress_len].astype(kv.dtype)
+                    local = cidx
                 kv_all = mx.concatenate([kv_all, comp], axis=1)
-                idxs = mx.concatenate([idxs, cidx], axis=-1)
+                idxs = mx.concatenate([idxs, local], axis=-1)
 
         sink = mx.zeros_like(self.attn_sink) if self._break_sink else self.attn_sink
-        o = sparse_attn(q, kv_all, sink, idxs, self.softmax_scale)
+        if fused:
+            # the kernels read the ring and the selected compressed rows in place
+            selected = (None, None, 0)
+            if self.ratio and compress_len:
+                selected = (src.comp_kv, cidx, offset)
+            o = decode_attention.attend(
+                q,
+                lc.win_kv,
+                start_pos,
+                *selected,
+                sink,
+                c_q,
+                s_q,
+                self.softmax_scale,
+                rd,
+            )
+        else:
+            o = sparse_attn(q, kv_all, sink, idxs, self.softmax_scale)
+            # --- inverse rope ---
+            if not self._break_rope_inverse:
+                o = rope_tail(o, rd, c_q, s_q, inverse=True)
 
-        # --- inverse rope, grouped block-diagonal output LoRA ---
-        if not self._break_rope_inverse:
-            o = rope_tail(o, rd, c_q, s_q, inverse=True)
+        # --- grouped block-diagonal output LoRA ---
         o = o.reshape(bsz, n, self.n_groups, -1)
         # QuantizedMultiLinear treats the penultimate axis as matrix rows;
         # retain a singleton row so the group axis broadcasts against the

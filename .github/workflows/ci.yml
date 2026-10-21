@@ -634,14 +634,23 @@ jobs:
             tests/test_speculative_request_policy.py \
             tests/test_deepseek_v4_vendored.py \
             tests/test_deepseek_v41_artifacts.py \
+            tests/test_deepseek_v41_decode_attention.py \
             tests/test_deepseek_v41_affine_route_qmv.py \
             tests/test_deepseek_v41_head_gemv.py \
+            tests/test_deepseek_v41_gate_gemv.py \
+            tests/test_deepseek_v41_fused_moe.py \
+            tests/test_deepseek_v41_mixed_precision_fallback.py \
             tests/test_deepseek_v41_dspark.py \
+            tests/test_deepseek_v41_decode_overhead.py \
+            tests/test_deepseek_v41_sparse_gather.py \
+            tests/test_deepseek_v41_draft_numerics.py \
             tests/test_deepseek_v41_engram_offload.py \
             tests/test_deepseek_v41_hyper_connections.py \
             tests/test_deepseek_v41_native_load.py \
             tests/test_deepseek_v41_phase7.py \
             tests/test_deepseek_v41_ring_rollback.py \
+            tests/test_deepseek_v41_rope_quant.py \
+            tests/test_deepseek_v41_prefill.py \
             tests/test_model_load_entrypoint_boundaries.py \
             tests/test_dspark_scheduler.py \
             tests/test_scheduler_admission_policy.py \
