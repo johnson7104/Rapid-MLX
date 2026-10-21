@@ -13,43 +13,31 @@ rapid-mlx supports audio processing using [mlx-audio](https://github.com/Blaizzy
 - **Zero-shot voice cloning**: IndexTTS, Qwen3-TTS Base, F5-TTS, Chatterbox
 - **Audio Processing**: SAM-Audio (voice separation)
 
-## Supported Aliases (R10-C1)
+## Start with text-to-speech
 
-`rapid-mlx serve <alias>` recognizes the audio alias surface below and routes the request to the audio engines (skipping the text-LM loader). Both the short alias and the full HuggingFace id work — pasting a full HF id from `mlx-community/...` of an audio model takes the audio path automatically.
+On an Apple Silicon Mac, install Rapid-MLX, restart Terminal, then add the audio runtime and start Kokoro:
 
-| Alias | Type | HuggingFace id |
-| --- | --- | --- |
-| `kokoro` (aka `kokoro-82m`, `kokoro-82m-bf16`) | TTS | `mlx-community/Kokoro-82M-bf16` |
-| `kokoro-4bit` / `kokoro-82m-4bit` | TTS | `mlx-community/Kokoro-82M-4bit` |
-| `kokoro-8bit` / `kokoro-82m-8bit` | TTS | `mlx-community/Kokoro-82M-8bit` |
-| `chatterbox` | TTS | `mlx-community/chatterbox-turbo-fp16` |
-| `chatterbox-4bit` | TTS | `mlx-community/chatterbox-turbo-4bit` |
-| `vibevoice` / `vibevoice-realtime` | TTS | `mlx-community/VibeVoice-Realtime-0.5B-4bit` |
-| `voxcpm` | TTS | `mlx-community/VoxCPM1.5` |
-| `dia` | TTS | `mlx-community/Dia-1.6B-4bit` |
-| `indextts` / `indextts-1.5` | TTS voice cloning | `mlx-community/IndexTTS-1.5` |
-| `qwen3-tts` / `qwen3-tts-customvoice` | TTS | `mlx-community/Qwen3-TTS-12Hz-1.7B-CustomVoice-bf16` |
-| `qwen3-tts-6bit` | TTS | `mlx-community/Qwen3-TTS-12Hz-1.7B-CustomVoice-6bit` |
-| `qwen3-tts-4bit` | TTS | `mlx-community/Qwen3-TTS-12Hz-1.7B-CustomVoice-4bit` |
-| `qwen3-tts-voicedesign` | TTS | `mlx-community/Qwen3-TTS-12Hz-1.7B-VoiceDesign-bf16` |
-| `qwen3-tts-voicedesign-8bit` | TTS | `mlx-community/Qwen3-TTS-12Hz-1.7B-VoiceDesign-8bit` |
-| `qwen3-tts-voicedesign-4bit` | TTS | `mlx-community/Qwen3-TTS-12Hz-1.7B-VoiceDesign-4bit` |
-| `qwen3-tts-clone` | TTS voice cloning | `mlx-community/Qwen3-TTS-12Hz-1.7B-Base-bf16` |
-| `f5-tts-zh` | TTS voice cloning | `lucasnewman/f5-tts-mlx` |
-| `whisper` / `whisper-1` / `whisper-large-v3` | STT | `mlx-community/whisper-large-v3-mlx` |
-| `whisper-large-v3-turbo` | STT | `mlx-community/whisper-large-v3-turbo` |
-| `whisper-medium` | STT | `mlx-community/whisper-medium-mlx` |
-| `whisper-small` | STT | `mlx-community/whisper-small-mlx` |
-| `whisper-base` | STT | `mlx-community/whisper-base-mlx` |
-| `whisper-tiny` | STT | `mlx-community/whisper-tiny-mlx` |
-| `parakeet` / `parakeet-tdt-0.6b` / `parakeet-tdt-0.6b-v2` | STT | `mlx-community/parakeet-tdt-0.6b-v2` |
-| `parakeet-v3` / `parakeet-tdt-0.6b-v3` | STT | `mlx-community/parakeet-tdt-0.6b-v3` |
-| `sensevoice` / `sensevoice-small` | STT | `mlx-community/SenseVoiceSmall` |
-| `qwen3-aligner` / `qwen3-forced-aligner` | Forced alignment | `mlx-community/Qwen3-ForcedAligner-0.6B-8bit` |
+```bash
+curl -fsSL https://rapidmlx.com/install.sh | bash
+# Restart Terminal, then:
+~/.rapid-mlx/bin/python -m pip install 'rapid-mlx[audio]'
+rapid-mlx serve kokoro
+```
 
-Run `rapid-mlx models` to see the full live list (the section header reads "Audio models" with `[audio:tts]` / `[audio:stt]` tags).
+In another terminal, send a short request to the address printed by the server:
 
-Audio engines load lazily on the first `/v1/audio/*` request — `rapid-mlx serve` returns as soon as the FastAPI app is bound, with no boot-time weight download.
+```bash
+curl http://127.0.0.1:8000/v1/audio/speech \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"kokoro","input":"Hello from Rapid-MLX","voice":"af_heart"}' \
+  --output hello.wav
+```
+
+For transcription, start `rapid-mlx serve whisper-large-v3` and use the request under [STT quick start](#stt-quick-start).
+
+## Choose an audio model
+
+Run `rapid-mlx models` to browse the current audio aliases. Common starting points are `kokoro` for speech synthesis and `whisper-large-v3` for transcription. Use `rapid-mlx models --json` for repository names and `rapid-mlx info <alias>` for memory requirements. The [model catalog](https://rapidmlx.com/docs/aliases.html) is the longer browsing guide.
 
 ### TTS quick start
 
@@ -204,38 +192,18 @@ If `mlx-audio` is missing, the boot guard exits with rc=2 and the install hint:
 
 ```
 error: model 'kokoro' is an audio alias and requires the optional `mlx-audio` dependency (shipped with the [audio] extra).
-Install with: pip install 'rapid-mlx[audio]'
+Install with: ~/.rapid-mlx/bin/python -m pip install 'rapid-mlx[audio]'
 ```
 
 ## Installation
 
-```bash
-# Core audio support — 0.5.3 adds the Silero VAD runtime used by Whisper
-# while retaining the Kokoro istftnet fix
-pip install 'mlx-audio>=0.5.3,<0.6'
-
-# Required dependencies for TTS
-pip install sounddevice soundfile scipy misaki spacy num2words phonemizer-fork numba tiktoken loguru
-
-# Download spacy English model
-python -m spacy download en_core_web_sm
-
-# For non-English TTS (Spanish, French, etc.), install espeak-ng:
-# macOS
-brew install espeak-ng
-
-# Ubuntu/Debian
-# sudo apt-get install espeak-ng
-```
-
-Or (recommended) install all audio dependencies at once — the `[audio]`
-extra carries the supported `mlx-audio` version pin for you:
+The official installer creates `~/.rapid-mlx/bin/python`. Add all supported audio dependencies to that environment:
 
 ```bash
-pip install 'rapid-mlx[audio]'
-python -m spacy download en_core_web_sm
-brew install espeak-ng  # macOS, for non-English languages
+~/.rapid-mlx/bin/python -m pip install 'rapid-mlx[audio]'
 ```
+
+For non-English speech synthesis, install `espeak-ng` with `brew install espeak-ng`. Some examples need additional voice data; follow the model's setup instructions when prompted.
 
 ## Quick Start
 
@@ -293,8 +261,8 @@ processor.save(result.residual, "background_only.wav")
 
 **CLI Example:**
 ```bash
-python examples/audio_separation_example.py meeting.mp3 --play
-python examples/audio_separation_example.py song.mp3 --description music -o music.wav
+~/.rapid-mlx/bin/python examples/audio_separation_example.py meeting.mp3 --play
+~/.rapid-mlx/bin/python examples/audio_separation_example.py song.mp3 --description music -o music.wav
 ```
 
 ### Drums Separation Demo
@@ -305,7 +273,7 @@ you have the rights to use — `--description` takes a free-form stem name
 complementary mix:
 
 ```bash
-python examples/audio_separation_example.py your_song.mp3 \
+~/.rapid-mlx/bin/python examples/audio_separation_example.py your_song.mp3 \
   --description "drums" \
   --output drums_isolated.wav \
   --background song_no_drums.wav
@@ -585,74 +553,76 @@ curl http://localhost:8000/v1/audio/voices?model=kokoro
 
 ## CLI Examples
 
+The following scripts live in the repository’s `examples/` directory; run them from a source checkout.
+
 ### Live Transcription / Closed Captions
 
 Real-time speech-to-text transcription from your microphone:
 
 ```bash
 # Closed captions with whisper-large-v3 (best quality)
-python examples/closed_captions.py --language es --chunk 5
+~/.rapid-mlx/bin/python examples/closed_captions.py --language es --chunk 5
 
 # Faster model for lower latency
-python examples/closed_captions.py --language en --model whisper-turbo --chunk 3
+~/.rapid-mlx/bin/python examples/closed_captions.py --language en --model whisper-turbo --chunk 3
 
 # Basic mic transcription (record then transcribe)
-python examples/mic_transcribe.py --language es
+~/.rapid-mlx/bin/python examples/mic_transcribe.py --language es
 
 # Real-time chunked transcription
-python examples/mic_realtime.py --language es --chunk 3
+~/.rapid-mlx/bin/python examples/mic_realtime.py --language es --chunk 3
 
 # Live transcription with voice activity detection
-python examples/mic_live.py --language es
+~/.rapid-mlx/bin/python examples/mic_live.py --language es
 ```
 
 **Requirements:**
 ```bash
-pip install sounddevice soundfile numpy
+~/.rapid-mlx/bin/python -m pip install sounddevice soundfile numpy
 ```
 
 ### Basic TTS
 
 ```bash
 # Simple TTS example
-python examples/tts_example.py "Hello, how are you?" --play
+~/.rapid-mlx/bin/python examples/tts_example.py "Hello, how are you?" --play
 
 # With different voice
-python examples/tts_example.py "Hello!" --voice am_michael --play
+~/.rapid-mlx/bin/python examples/tts_example.py "Hello!" --voice am_michael --play
 
 # Save to file
-python examples/tts_example.py "Welcome to the demo" -o greeting.wav
+~/.rapid-mlx/bin/python examples/tts_example.py "Welcome to the demo" -o greeting.wav
 
 # List available voices
-python examples/tts_example.py --list-voices
+~/.rapid-mlx/bin/python examples/tts_example.py --list-voices
 ```
 
 ### Multilingual TTS
 
 ```bash
 # English (auto-selects best model)
-python examples/tts_multilingual.py "Hello world" --play
+~/.rapid-mlx/bin/python examples/tts_multilingual.py "Hello world" --play
 
 # Spanish
-python examples/tts_multilingual.py "Hola mundo" --lang es --play
+~/.rapid-mlx/bin/python examples/tts_multilingual.py "Hola mundo" --lang es --play
 
 # French
-python examples/tts_multilingual.py "Bonjour le monde" --lang fr --play
+~/.rapid-mlx/bin/python examples/tts_multilingual.py "Bonjour le monde" --lang fr --play
 
 # Japanese
-python examples/tts_multilingual.py "こんにちは" --lang ja --play
+~/.rapid-mlx/bin/python examples/tts_multilingual.py "こんにちは" --lang ja --play
 
 # Chinese
-python examples/tts_multilingual.py "你好世界" --lang zh --play
+~/.rapid-mlx/bin/python examples/tts_multilingual.py "你好世界" --lang zh --play
 
 # Use specific model
-python examples/tts_multilingual.py "Hello" --model chatterbox --play
+~/.rapid-mlx/bin/python examples/tts_multilingual.py "Hello" --model chatterbox --play
 
 # List all models
-python examples/tts_multilingual.py --list-models
+~/.rapid-mlx/bin/python examples/tts_multilingual.py --list-models
 
 # List all languages
-python examples/tts_multilingual.py --list-languages
+~/.rapid-mlx/bin/python examples/tts_multilingual.py --list-languages
 ```
 
 ### Business Assistant Voice Examples
@@ -669,22 +639,22 @@ Pre-generated voice samples with **native voices** for common business use cases
 **Generate your own with native voices:**
 ```bash
 # English - Bank assistant (native voice: af_heart)
-python -m mlx_audio.tts.generate --model mlx-community/Kokoro-82M-bf16 \
+~/.rapid-mlx/bin/python -m mlx_audio.tts.generate --model mlx-community/Kokoro-82M-bf16 \
   --text "Welcome to First National Bank. How may I assist you today?" \
   --voice af_heart --lang_code a --file_prefix assistant_bank_en
 
 # Spanish - Customer service (native voice: ef_dora)
-python -m mlx_audio.tts.generate --model mlx-community/Kokoro-82M-bf16 \
+~/.rapid-mlx/bin/python -m mlx_audio.tts.generate --model mlx-community/Kokoro-82M-bf16 \
   --text "Gracias por llamar a servicio al cliente. Un agente le atendera pronto." \
   --voice ef_dora --lang_code e --file_prefix assistant_service_es
 
 # French - Call center (native voice: ff_siwis)
-python -m mlx_audio.tts.generate --model mlx-community/Kokoro-82M-bf16 \
+~/.rapid-mlx/bin/python -m mlx_audio.tts.generate --model mlx-community/Kokoro-82M-bf16 \
   --text "Bienvenue. Votre appel est important pour nous." \
   --voice ff_siwis --lang_code f --file_prefix assistant_callcenter_fr
 
 # Chinese - Tech support (native voice: zf_xiaobei)
-python -m mlx_audio.tts.generate --model mlx-community/Kokoro-82M-bf16 \
+~/.rapid-mlx/bin/python -m mlx_audio.tts.generate --model mlx-community/Kokoro-82M-bf16 \
   --text "欢迎致电技术支持中心。我们将竭诚为您服务。" \
   --voice zf_xiaobei --lang_code z --file_prefix assistant_support_zh
 ```
@@ -818,11 +788,10 @@ Tested on Apple M2 Max (32GB).
 
 ### mlx-audio not installed
 ```bash
-pip install 'rapid-mlx[audio]'
+~/.rapid-mlx/bin/python -m pip install 'rapid-mlx[audio]'
 ```
 This installs `mlx-audio` with the supported version pin
-(`mlx-audio>=0.5.3,<0.6`). This range includes the Silero VAD runtime used
-to reject silent Whisper input and excludes the historical Kokoro regression.
+(`mlx-audio>=0.5.3,<0.6`). This range includes the Silero VAD runtime used to reject silent Whisper input.
 
 ### Model download slow
 Models are downloaded from HuggingFace on first use. Use `huggingface-cli download` to pre-download:
@@ -836,13 +805,3 @@ Use smaller models or 4-bit quantized versions:
 - `whisper-small-mlx` instead of `whisper-large-v3-mlx`
 - `Kokoro-82M-4bit` instead of `Kokoro-82M-bf16`
 - `sam-audio-small` instead of `sam-audio-large`
-
-### Kokoro multilingual bug (mlx-audio 0.2.9 only — historical)
-
-mlx-audio 0.2.9 exactly had a Kokoro g2p bug: non-English languages
-(Spanish, Chinese, Japanese, etc.) crashed with `ValueError: too many
-values to unpack` because English g2p returned a tuple `(phonemes, tokens)`
-while other languages returned just a string. Newer releases inside the
-supported range (`mlx-audio>=0.5.3,<0.6`) no longer contain the buggy
-unpacking. If you hit this error, upgrade `mlx-audio` within the pinned range
-instead of hand-patching the package.
