@@ -20,13 +20,14 @@ Engram layers apply their gated n-gram lookup to the hc-expanded stream
 from __future__ import annotations
 
 from dataclasses import replace
+from typing import Any
 
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 
 from .attention import Attention
-from .cache import ModelCache
+from .cache import BatchModelCache, ModelCache
 from .config import ModelArgs
 from .engram import Engram, EngramHasher
 from .head_gemv import head_logits
@@ -158,23 +159,57 @@ class Model(nn.Module):
     def __call__(
         self,
         input_ids: mx.array,
-        cache: ModelCache,
+        cache: ModelCache | BatchModelCache,
         last_logit_only: bool = False,
         return_dspark_hidden: bool = False,
         enable_rollback: bool = False,
     ) -> mx.array | tuple[mx.array, mx.array]:
-        """input_ids [b, n] continue the sequence at cache.offset. Advances the cache."""
-        start_pos = cache.offset
-        if enable_rollback:
-            cache.begin_forward()
-        elif cache.rollback_start is not None:
-            cache.disable_rollback()
+        """Continue tokens and advance the cache.
+
+        ModelCache retains the chunk/lockstep [b, n, vocab] contract. A
+        BatchModelCache accepts only [rows, 1], at independent row positions,
+        and returns [rows, vocab] when last_logit_only is set.
+        """
+        batch_cache = cache if isinstance(cache, BatchModelCache) else None
+        single_cache = None if isinstance(cache, BatchModelCache) else cache
+        start_pos: Any
+        if batch_cache is not None:
+            if input_ids.shape != (len(batch_cache), 1) or not len(batch_cache):
+                raise ValueError("batched decode requires nonempty tokens [rows, 1]")
+            if batch_cache.args != self.args:
+                raise ValueError("batched cache configuration does not match model")
+            if np.any(batch_cache.offsets >= batch_cache.max_seq_len):
+                raise ValueError("batched decode exceeds cache sequence capacity")
+            if enable_rollback:
+                batch_cache.begin_forward()  # raises: decode rows have no rollback
+            start_pos = batch_cache.positions
+        else:
+            assert single_cache is not None
+            start_pos = single_cache.offset
+            if enable_rollback:
+                single_cache.begin_forward()
+            elif single_cache.rollback_start is not None:
+                single_cache.disable_rollback()
         b, n = input_ids.shape
 
         hashes = None
         if self.engram_hasher is not None:
             ids_np = np.array(input_ids, dtype=np.int64)
-            hashes_np = self.engram_hasher(ids_np, start_pos, cache.engram_ids)
+            if batch_cache is not None:
+                engram_ids = batch_cache.engram_ids
+                assert engram_ids is not None
+                hashes_np = np.concatenate(
+                    [
+                        self.engram_hasher(
+                            ids_np[row : row + 1],
+                            int(position),
+                            engram_ids[row : row + 1],
+                        )
+                        for row, position in enumerate(batch_cache.offsets)
+                    ]
+                )
+            else:
+                hashes_np = self.engram_hasher(ids_np, start_pos, cache.engram_ids)
             for layer in self.layers:
                 if layer.engram is not None and hasattr(layer.engram.embed, "prefetch"):
                     layer.engram.embed.prefetch(
@@ -225,7 +260,13 @@ class Model(nn.Module):
             h = h[:, -1:]
         # fp32 logits, as the reference
         logits = head_logits(self.head, h.astype(mx.float32))
-        cache.offset = start_pos + n
+        if batch_cache is not None:
+            batch_cache.advance()
+            if last_logit_only:
+                logits = logits[:, 0]
+        else:
+            assert single_cache is not None
+            single_cache.offset = start_pos + n
         if return_dspark_hidden:
             missing = [
                 layer_id
