@@ -368,12 +368,22 @@ def main() -> None:
                     )
                     from rapid_mlx.agents.opencode_version import installed_version
 
-                    command = isolated._command(agent, root, MODEL, port)
                     if known_bad:
-                        command += f" --model rapid-mlx/{MODEL}"
-                    command += " run"
-                    if (installed_version() or "").startswith("2."):
-                        command += " --standalone"
+                        # Recreate the removed top-level --model invocation.
+                        command = isolated._command(
+                            agent, root, MODEL, port, version=installed_version()
+                        )
+                        command = command.removesuffix(" --standalone")
+                        command += f" --model rapid-mlx/{MODEL} run"
+                    else:
+                        command = isolated._command(
+                            agent,
+                            root,
+                            MODEL,
+                            port,
+                            version=installed_version(),
+                            opencode_run=True,
+                        )
                     command += " " + shlex.quote("Say " + REPLY)
                     cmd = ["sh", "-c", command]
                 before = len(Handler.requests)

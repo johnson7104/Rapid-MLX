@@ -18,6 +18,7 @@ import select
 import shutil
 import signal
 import socket
+import sqlite3
 import struct
 import subprocess
 import termios
@@ -80,6 +81,11 @@ def preserved(before: dict[str, str], after: dict[str, str]) -> bool:
     return bool(before) and all(
         after.get(path) == digest for path, digest in before.items()
     )
+
+
+def rapid_config_untouched(home: Path, agent: str, before: dict[str, str]) -> bool:
+    """Check immediately after Rapid launch/removal, before opening native mode."""
+    return preserved(before, snapshot(home, agent))
 
 
 def classified_error(value: str) -> str:
@@ -301,7 +307,7 @@ def handle_first_run_menus(
     if agent != "claude-code":
         return output
     answered = set()
-    for _ in range(4):
+    for _ in range(5):
         screen = _compact_screen(output)
         if "choosethetextstyle" in screen and "theme" not in answered:
             answered.add("theme")
@@ -311,8 +317,24 @@ def handle_first_run_menus(
             os.write(master, b"\x1b[A")  # default is No; select Yes
             time.sleep(0.3)
             os.write(master, b"\r")
-        elif "trustthefilesinthisfolder" in screen and "trust" not in answered:
+        elif (
+            "trust" in screen
+            and "folder" in screen
+            and "yes," in screen
+            and "no,exit" in screen
+            and "trust" not in answered
+        ):
             answered.add("trust")
+            if screen.rfind("no,exit") < screen.rfind("yes,"):
+                os.write(master, b"\x1b[B")  # New menu highlights No first.
+                time.sleep(0.3)
+            os.write(master, b"\r")
+        elif (
+            "promptinjection" in screen
+            and "tocontinue" in screen
+            and "security" not in answered
+        ):
+            answered.add("security")
             os.write(master, b"\r")
         else:
             break
@@ -326,6 +348,55 @@ def reply_finished(agent: str, output: str) -> bool:
     if agent == "goose":
         return "⏱" in output
     return True
+
+
+def opencode_reply_seen(home: Path, since: float, hello: str, nonce: str) -> bool:
+    """Read one v2 conversation instead of fragmented TUI redraws."""
+    db = home / ".rapid-mlx/connect/agents/opencode/xdg-data/opencode/opencode.db"
+    if not db.is_file():
+        return False
+    try:
+        with sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=0.2) as conn:
+            rows = conn.execute(
+                "SELECT session_id, data FROM session_message WHERE type = 'assistant' "
+                "AND time_created >= ? ORDER BY time_created, seq",
+                (int(since * 1000),),
+            ).fetchall()
+    except sqlite3.Error:
+        return False
+    sessions: dict[str, tuple[set[str], list[str]]] = {}
+    for session_id, raw in rows:
+        try:
+            message = json.loads(raw)
+        except json.JSONDecodeError:
+            return False
+        reads, replies = sessions.setdefault(session_id, (set(), []))
+        for part in message.get("content", []):
+            if part.get("type") == "tool" and part.get("name") == "read":
+                state = part.get("state", {})
+                if state.get("status") == "completed":
+                    path = Path(state.get("input", {}).get("path", "")).name
+                    contents = " ".join(
+                        item.get("text", "") for item in state.get("content", [])
+                    )
+                    if path == "hello.txt" and hello in contents:
+                        reads.add("hello.txt")
+                    if path == "nonce.txt" and nonce in contents:
+                        reads.add("nonce.txt")
+            elif part.get("type") == "text" and message.get("time", {}).get(
+                "completed"
+            ):
+                replies.append(part.get("text", ""))
+    return any(
+        reads == {"hello.txt", "nonce.txt"}
+        and any(hello in reply and nonce in reply for reply in replies)
+        for reads, replies in sessions.values()
+    )
+
+
+def is_opencode_v2(version_text: str) -> bool:
+    """Route by CLI major version, not a matching minor component."""
+    return bool(re.match(r"^(?:opencode\s+)?v?2\.", version_text, re.IGNORECASE))
 
 
 def approval_handler(agent: str, master: int):
@@ -405,21 +476,25 @@ def session(
     timeout: float,
     day_two: bool,
 ) -> dict:
+    opencode_v2 = command[2] == "opencode" and is_opencode_v2(version("opencode", env))
     marker = uuid.uuid4().hex[:12]
     target = workspace / "hello.txt"
-    challenge1 = f"verify-{uuid.uuid4().hex}"
-    challenge2 = f"verify-{uuid.uuid4().hex}"
-    (workspace / "challenge.txt").write_text(challenge1 + "\n")
+    nonce1 = f"nonce-{uuid.uuid4().hex[:12]}"
+    nonce2 = f"nonce-{uuid.uuid4().hex[:12]}"
+    nonce_file = workspace / "nonce.txt"
+    nonce_file.write_text(nonce1 + "\n")
     if target.exists():
         target.unlink()
     first_prompt = (
         f"Create hello.txt containing exactly hi-{marker}. Use a tool to read "
-        "both hello.txt and challenge.txt, then report their contents."
+        "both hello.txt and nonce.txt. Quote each file's exact line in your "
+        "reply. nonce.txt is independent of hello.txt; do not edit it."
     )
     second_prompt = (
         f"Use a tool to replace hello.txt with exactly hi-{marker}-second "
-        "(one trailing newline is okay). Read both hello.txt and challenge.txt "
-        "again with a tool and report their contents."
+        "(one trailing newline is okay). Read both hello.txt and nonce.txt "
+        "again with a tool. Quote each file's exact line in your reply. "
+        "nonce.txt is independent of hello.txt; do not edit it."
     )
     master, slave = open_terminal()
     started = time.monotonic()
@@ -446,6 +521,12 @@ def session(
         "prompt2_at": None,
         "ended_at": None,
     }
+
+    def reply_seen(output: str, hello: str, nonce: str, since: float) -> bool:
+        if opencode_v2:
+            return opencode_reply_seen(Path(env["HOME"]), since, hello, nonce)
+        return nonce in output and reply_finished(command[2], output)
+
     with transcript.open("wb") as sink:
         try:
             opening, _ = read_until(
@@ -470,28 +551,30 @@ def session(
             output, _ = read_until(
                 master,
                 proc,
-                min(120, timeout),
+                timeout,
                 sink,
                 stop_when=lambda output: (
                     target.is_file()
                     and target.read_text().strip() == f"hi-{marker}"
-                    and challenge1 in output
-                    and reply_finished(command[2], output)
+                    and nonce_file.is_file()
+                    and nonce_file.read_text().strip() == nonce1
+                    and reply_seen(output, f"hi-{marker}", nonce1, answer["prompt1_at"])
                 ),
                 on_output=approve,
             )
             answer["tool_ok"] = (
                 target.is_file()
                 and target.read_text().strip() == f"hi-{marker}"
-                and challenge1 in output
-                and reply_finished(command[2], output)
+                and nonce_file.is_file()
+                and nonce_file.read_text().strip() == nonce1
+                and reply_seen(output, f"hi-{marker}", nonce1, answer["prompt1_at"])
             )
             if answer["tool_ok"]:
                 # The terminal first echoes our input. Completion is the first
                 # reliable upper bound for a reply that used a tool.
                 answer["first_reply_s"] = round(time.monotonic() - sent, 2)
             if proc.poll() is None:
-                (workspace / "challenge.txt").write_text(challenge2 + "\n")
+                nonce_file.write_text(nonce2 + "\n")
                 sent = time.monotonic()
                 answer["prompt2_at"] = time.time()
                 approve = approval_handler(command[2], master)
@@ -499,21 +582,33 @@ def session(
                 output2, _ = read_until(
                     master,
                     proc,
-                    min(90, timeout),
+                    timeout,
                     sink,
                     stop_when=lambda output: (
                         target.is_file()
                         and target.read_text().strip() == f"hi-{marker}-second"
-                        and challenge2 in output
-                        and reply_finished(command[2], output)
+                        and nonce_file.is_file()
+                        and nonce_file.read_text().strip() == nonce2
+                        and reply_seen(
+                            output,
+                            f"hi-{marker}-second",
+                            nonce2,
+                            answer["prompt2_at"],
+                        )
                     ),
                     on_output=approve,
                 )
                 answer["second_ok"] = (
                     target.is_file()
                     and target.read_text().strip() == f"hi-{marker}-second"
-                    and challenge2 in output2
-                    and reply_finished(command[2], output2)
+                    and nonce_file.is_file()
+                    and nonce_file.read_text().strip() == nonce2
+                    and reply_seen(
+                        output2,
+                        f"hi-{marker}-second",
+                        nonce2,
+                        answer["prompt2_at"],
+                    )
                 )
                 if answer["second_ok"]:
                     answer["second_reply_s"] = round(time.monotonic() - sent, 2)
@@ -596,6 +691,23 @@ def normal_mode(
         finally:
             stop_terminal_process(proc)
             os.close(master)
+
+
+def check_then_open_native(
+    home: Path,
+    agent: str,
+    before: dict[str, str],
+    env: dict[str, str],
+    workspace: Path,
+    transcript: Path,
+) -> tuple[bool, bool]:
+    """Attribute user-config changes to Rapid before native CLI bookkeeping."""
+    untouched = rapid_config_untouched(home, agent, before)
+    try:
+        opened = normal_mode(BINARIES[agent], env, workspace, transcript)
+    except OSError:
+        opened = False
+    return untouched, opened
 
 
 def live_server_pid(home: Path) -> int | None:
@@ -739,13 +851,17 @@ def main() -> int:
             removed.returncode == 0
             and not (args.home / ".rapid-mlx/connect/agents" / agent).exists()
         )
-        try:
-            row["normal_mode_opens"] = normal_mode(
-                BINARIES[agent], env, work, args.output / agent / "normal-mode.pty"
-            )
-        except OSError:
-            row["normal_mode_opens"] = False
-        row["config_untouched"] = preserved(before, snapshot(args.home, agent))
+        # Rapid's private launch and removal must not change a user config.
+        # The native CLI may add its own first-run bookkeeping when opened
+        # below, so compare before starting that separate native session.
+        row["config_untouched"], row["normal_mode_opens"] = check_then_open_native(
+            args.home,
+            agent,
+            before,
+            env,
+            work,
+            args.output / agent / "normal-mode.pty",
+        )
         row["ugly_output"] = output_issues(
             args.output / agent / "day-one.pty",
             args.output / agent / "day-two.pty",

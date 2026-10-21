@@ -4,15 +4,21 @@ import asyncio
 import io
 import json
 import signal
+import sqlite3
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from scripts.agent_e2e.instrument.sitecustomize import _Tap
 from scripts.agent_e2e.run import (
     approval_handler,
+    check_then_open_native,
     classified_error,
     handle_first_run_menus,
+    is_opencode_v2,
+    opencode_reply_seen,
     output_issues,
     preserved,
+    rapid_config_untouched,
     read_until,
     reply_finished,
     request_evidence,
@@ -21,6 +27,97 @@ from scripts.agent_e2e.run import (
     stop_terminal_process,
 )
 from scripts.agent_e2e.seed_home import FILES
+
+
+def test_opencode_evidence_reader_follows_cli_major_version():
+    assert is_opencode_v2("opencode v2.1.2")
+    assert is_opencode_v2("2.1.2")
+    assert not is_opencode_v2("opencode v1.2.27")
+    assert not is_opencode_v2("opencode 1.2.3")
+
+
+def test_opencode_v2_reply_uses_completed_session_not_tui_fragments(tmp_path):
+    assert opencode_reply_seen(tmp_path, 10, "hi-abc", "nonce-def") is False
+    db = tmp_path / ".rapid-mlx/connect/agents/opencode/xdg-data/opencode/opencode.db"
+    db.parent.mkdir(parents=True)
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            "CREATE TABLE session_message "
+            "(session_id TEXT, type TEXT, time_created INTEGER, seq INTEGER, data TEXT)"
+        )
+        parts = [
+            {
+                "type": "tool",
+                "name": "read",
+                "state": {
+                    "status": "completed",
+                    "input": {"path": path},
+                    "content": [{"text": content}],
+                },
+            }
+            for path, content in (
+                ("hello.txt", "1: hi-abc"),
+                ("nonce.txt", "1: nonce-def"),
+            )
+        ]
+        parts.append({"type": "text", "text": "hi-abc and nonce-def"})
+        conn.execute(
+            "INSERT INTO session_message VALUES (?, ?, ?, ?, ?)",
+            (
+                "session-a",
+                "assistant",
+                11000,
+                1,
+                json.dumps({"time": {"completed": 12}, "content": parts}),
+            ),
+        )
+    assert opencode_reply_seen(tmp_path, 10, "hi-abc", "nonce-def") is True
+    assert opencode_reply_seen(tmp_path, 10, "hi-abc", "nonce-wrong") is False
+    assert opencode_reply_seen(tmp_path, 12, "hi-abc", "nonce-def") is False
+    with sqlite3.connect(db) as conn:
+        parts.pop(1)
+        conn.execute(
+            "UPDATE session_message SET data = ?",
+            (json.dumps({"time": {"completed": 12}, "content": parts}),),
+        )
+    assert opencode_reply_seen(tmp_path, 10, "hi-abc", "nonce-def") is False
+
+
+def test_opencode_v2_does_not_combine_reads_with_another_session(tmp_path):
+    db = tmp_path / ".rapid-mlx/connect/agents/opencode/xdg-data/opencode/opencode.db"
+    db.parent.mkdir(parents=True)
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            "CREATE TABLE session_message "
+            "(session_id TEXT, type TEXT, time_created INTEGER, seq INTEGER, data TEXT)"
+        )
+        reads = [
+            {
+                "type": "tool",
+                "name": "read",
+                "state": {
+                    "status": "completed",
+                    "input": {"path": path},
+                    "content": [{"text": value}],
+                },
+            }
+            for path, value in (("hello.txt", "hi-abc"), ("nonce.txt", "nonce-def"))
+        ]
+        for session_id, content in (
+            ("session-a", reads),
+            ("session-b", [{"type": "text", "text": "hi-abc nonce-def"}]),
+        ):
+            conn.execute(
+                "INSERT INTO session_message VALUES (?, ?, ?, ?, ?)",
+                (
+                    session_id,
+                    "assistant",
+                    11000,
+                    1,
+                    json.dumps({"time": {"completed": 12}, "content": content}),
+                ),
+            )
+    assert opencode_reply_seen(tmp_path, 10, "hi-abc", "nonce-def") is False
 
 
 def test_qwen_tool_approval_answers_once_per_prompt(monkeypatch):
@@ -86,6 +183,83 @@ def test_snapshot_only_tracks_preexisting_user_config(tmp_path):
     assert preserved(before, dict(before, **{".codex/session.json": "new"}))
     path.write_text(path.read_text() + "# changed\n")
     assert not preserved(before, snapshot(tmp_path, "codex"))
+
+
+def test_codex_native_bookkeeping_does_not_mask_rapid_config_write(tmp_path):
+    path = tmp_path / ".codex/config.toml"
+    path.parent.mkdir()
+    path.write_text(FILES[".codex/config.toml"])
+    before = snapshot(tmp_path, "codex")
+    assert rapid_config_untouched(tmp_path, "codex", before)
+
+    def native_mode(*_args):
+        path.write_text(path.read_text() + "\n[tui]\nseen = true\n")
+        return True
+
+    with patch("scripts.agent_e2e.run.normal_mode", side_effect=native_mode):
+        assert check_then_open_native(
+            tmp_path, "codex", before, {}, tmp_path, tmp_path / "native.pty"
+        ) == (True, True)
+    path.write_text(FILES[".codex/config.toml"])
+    # Negative control: a Rapid write to the seeded user config stays red.
+    path.write_text(path.read_text() + "\nmodel = 'rapid-overwrite'\n")
+    with patch("scripts.agent_e2e.run.normal_mode", return_value=True):
+        assert check_then_open_native(
+            tmp_path, "codex", before, {}, tmp_path, tmp_path / "native.pty"
+        ) == (False, True)
+    with patch("scripts.agent_e2e.run.normal_mode", side_effect=OSError):
+        assert check_then_open_native(
+            tmp_path, "codex", before, {}, tmp_path, tmp_path / "native.pty"
+        ) == (False, False)
+
+
+def test_claude_folder_trust_menu_selects_yes(monkeypatch):
+    writes = []
+    monkeypatch.setattr(
+        "scripts.agent_e2e.run.os.write", lambda _fd, data: writes.append(data)
+    )
+    monkeypatch.setattr("scripts.agent_e2e.run.time.sleep", lambda _seconds: None)
+    monkeypatch.setattr(
+        "scripts.agent_e2e.run.read_until", lambda *args: ("ready", None)
+    )
+    opening = (
+        "Accessing workspace: /private/project\n"
+        "Quick safety check: Is this a project you trust?\n"
+        "No, exit\nYes, I trust this folder\nEnter to confirm"
+    )
+    handle_first_run_menus("claude-code", opening, 1, None, None)
+    assert writes == [b"\x1b[B", b"\r"]
+    writes.clear()
+    old_menu = (
+        "Do you trust the files in this folder?\n"
+        "1. Yes, proceed\n2. No, exit\nEnter to confirm"
+    )
+    handle_first_run_menus("claude-code", old_menu, 1, None, None)
+    assert writes == [b"\r"]
+
+
+def test_claude_security_page_is_confirmed_before_folder_trust(monkeypatch):
+    writes = []
+    pages = iter(
+        (
+            "Accessing workspace /private/project\nNo, exit\n"
+            "Yes, I trust this folder\nEnter to confirm",
+            "ready",
+        )
+    )
+    monkeypatch.setattr(
+        "scripts.agent_e2e.run.os.write", lambda _fd, data: writes.append(data)
+    )
+    monkeypatch.setattr("scripts.agent_e2e.run.time.sleep", lambda _seconds: None)
+    monkeypatch.setattr(
+        "scripts.agent_e2e.run.read_until", lambda *args: (next(pages), None)
+    )
+    opening = (
+        "Security notes: Due to prompt injection risks, only use code you trust. "
+        "Press Enter to continue"
+    )
+    handle_first_run_menus("claude-code", opening, 1, None, None)
+    assert writes == [b"\r", b"\x1b[B", b"\r"]
 
 
 def test_request_evidence_never_substitutes_config_model(tmp_path):

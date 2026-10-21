@@ -603,7 +603,30 @@ def test_new_opencode_model_comes_from_private_config(private_home):
     runner = (root / "run").read_text()
     assert "OPENCODE_CONFIG=" in runner
     assert "OPENCODE_CONFIG_CONTENT=" in runner
+    assert "opencode --standalone" in runner
     assert "opencode --model" not in runner
+    smoke = isolated._command(
+        "opencode", root, "qwen3.5-9b-4bit", 7660, version="2.1.2", opencode_run=True
+    )
+    assert smoke.endswith("opencode run --standalone")
+
+
+def test_old_opencode_runner_keeps_v1_cli_flags(private_home):
+    with patch(
+        "rapid_mlx.agents.opencode_version.installed_version", return_value="1.0.0"
+    ):
+        isolated.configure("opencode", "qwen3.5-9b-4bit")
+    runner = (isolated.connection_dir() / "agents" / "opencode" / "run").read_text()
+    assert "opencode --standalone" not in runner
+    smoke = isolated._command(
+        "opencode",
+        isolated.connection_dir() / "agents" / "opencode",
+        "qwen3.5-9b-4bit",
+        7660,
+        version="1.0.0",
+        opencode_run=True,
+    )
+    assert smoke.endswith("opencode run")
 
 
 def test_isolated_dry_run_preserves_saved_profile(private_home, capsys):
@@ -937,6 +960,29 @@ def test_isolated_run_executes_when_ready(private_home):
         isolated.connection_dir() / "agents" / "codex" / "rapid.config.toml"
     ).read_text()
     assert tomllib.loads(config)["model_context_window"] == 98304
+
+
+def test_claude_launch_explains_folder_trust_without_pretrusting(private_home, capsys):
+    from rapid_mlx.launch.cli import launch_command
+
+    with (
+        patch("rapid_mlx.agents.isolated.connection_status", return_value="ready"),
+        patch("rapid_mlx.run.cli._fits_host", return_value=True),
+        patch("rapid_mlx.launch.cli.subprocess.call", return_value=0),
+        pytest.raises(SystemExit, match="0"),
+    ):
+        launch_command(
+            _launch_args(
+                "claude-code", "--isolated", "--run", "--model", "qwen3.5-9b-4bit"
+            )
+        )
+    assert "Review the folder before choosing Yes" in capsys.readouterr().out
+    settings = json.loads(
+        (
+            isolated.connection_dir() / "agents" / "claude-code" / "settings.json"
+        ).read_text()
+    )
+    assert "trustedDirectories" not in settings
 
 
 def test_running_model_reuses_single_checkpoint_with_two_advertised_ids():

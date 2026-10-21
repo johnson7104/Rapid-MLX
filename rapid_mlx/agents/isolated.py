@@ -314,7 +314,15 @@ def _display_cli_invocation() -> str:
     return invocation
 
 
-def _command(name: str, root: Path, model: str, port: int) -> str:
+def _command(
+    name: str,
+    root: Path,
+    model: str,
+    port: int,
+    *,
+    version: str | None = None,
+    opencode_run: bool = False,
+) -> str:
     quote = shlex.quote
     key = quote(str(key_path()))
     # The secret is read at invocation time, so rotating it does not stale a
@@ -334,6 +342,11 @@ def _command(name: str, root: Path, model: str, port: int) -> str:
         # Give the process a private home. Inline config has precedence over
         # project config, which would otherwise replace our selected model.
         config = quote(str(root / "opencode.json"))
+        # OpenCode 2.x otherwise joins its shared background service on a
+        # fixed port. That service may belong to the user's normal OpenCode
+        # session and does not inherit this private profile or Rapid key.
+        standalone = " --standalone" if not (version or "").startswith("1.") else ""
+        invocation = "opencode run" if opencode_run else "opencode"
         return (
             f'{credential} OPENCODE_CONFIG_CONTENT="$(cat {config})" '
             "env -u OPENCODE_CONFIG_DIR "
@@ -342,7 +355,7 @@ def _command(name: str, root: Path, model: str, port: int) -> str:
             f"XDG_DATA_HOME={quote(str(root / 'xdg-data'))} "
             f"XDG_CACHE_HOME={quote(str(root / 'xdg-cache'))} "
             f"XDG_STATE_HOME={quote(str(root / 'xdg-state'))} "
-            f"OPENCODE_CONFIG={config} opencode"
+            f"OPENCODE_CONFIG={config} {invocation}{standalone}"
         )
     if name == "hermes":
         return f"{credential} HERMES_HOME={quote(str(root))} hermes -p rapid chat --provider custom --model {quote(model)}"
@@ -731,7 +744,7 @@ def configure(
             "        environment[name] = value\n"
             "os.execvpe('crush', ['crush', '--data-dir', str(data_root / project_id)], environment)\n",
         )
-    command = _command(name, root, model, port)
+    command = _command(name, root, model, port, version=version)
     cli = _cli_invocation()
     runner = root / "run"
     # Reconfigure in the runner's execution directory before starting the
