@@ -58,11 +58,8 @@ first: `brew install python@3.12` then `python3.12 -m pip install rapid-mlx`.
 
 ### From source (for development)
 
-```bash
-git clone https://github.com/raullenchai/Rapid-MLX.git
-cd Rapid-MLX
-python3 -m pip install -e .
-```
+Follow the [contributor setup](../../CONTRIBUTING.md) to create a supported
+Python environment and install the repository in editable mode.
 
 ## Optional Extras
 
@@ -73,10 +70,15 @@ Audio, embeddings and the other features below
 ship as opt-in extras. `vision`, `image`, `video`, `dflash` and `mtp` remain
 accepted extra names for existing scripts; on macOS they add nothing.
 
-- **Audio:** `python3.12 -m pip install 'rapid-mlx[audio]'` adds speech and transcription.
-- **Embeddings:** `python3.12 -m pip install 'rapid-mlx[embeddings]'` adds embeddings.
-- **Browser chat:** `python3.12 -m pip install 'rapid-mlx[chat]'` adds the web UI.
-- **All optional runtimes:** `python3.12 -m pip install 'rapid-mlx[all]'`.
+After the official installer, add an extra to its Python environment:
+
+- **Audio:** `~/.rapid-mlx/bin/python -m pip install 'rapid-mlx[audio]'` adds speech and transcription.
+- **Embeddings:** `~/.rapid-mlx/bin/python -m pip install 'rapid-mlx[embeddings]'` adds embeddings.
+- **Browser chat:** `~/.rapid-mlx/bin/python -m pip install 'rapid-mlx[chat]'` adds the web UI.
+- **All optional runtimes:** `~/.rapid-mlx/bin/python -m pip install 'rapid-mlx[all]'`.
+
+If you installed with another Python environment, use that environment's
+Python with `-m pip` instead.
 
 When `rapid-mlx serve` finds that an optional runtime is absent, it prints a
 repair command matched to the detected install method. For a
