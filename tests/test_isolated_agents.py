@@ -173,6 +173,18 @@ def test_old_opencode_shape_and_hermes_auth(private_home):
         ).read_text()
     )
     assert "providers" not in config
+    assert config["model"] == "rapid-mlx/qwen3.5-9b-4bit"
+    runner = (isolated.connection_dir() / "agents" / "opencode" / "run").read_text()
+    assert "OPENCODE_CONFIG=" in runner
+    assert (
+        f"HOME={isolated.connection_dir() / 'agents' / 'opencode' / 'home'}" in runner
+    )
+    assert "XDG_CONFIG_HOME=" in runner
+    assert "XDG_DATA_HOME=" in runner
+    assert "env -u OPENCODE_CONFIG_DIR" in runner
+    assert "OPENCODE_CONFIG_CONTENT=" in runner
+    assert runner.index("OPENCODE_CONFIG_CONTENT=") < runner.index("env -u")
+    assert "opencode --model" not in runner
     isolated.configure("hermes", "qwen3.5-9b-4bit")
     hermes = (
         isolated.connection_dir()
@@ -478,6 +490,21 @@ def test_hermes_saved_runner_check_stops_on_missing_limit(private_home, capsys):
             _launch_args("hermes", "--isolated", "--check", "--model", "model")
         )
     assert "served limit unavailable" in capsys.readouterr().err
+
+
+def test_new_opencode_model_comes_from_private_config(private_home):
+    with patch(
+        "rapid_mlx.agents.opencode_version.installed_version", return_value="2.0.26"
+    ):
+        isolated.configure("opencode", "qwen3.5-9b-4bit")
+    root = isolated.connection_dir() / "agents" / "opencode"
+    config = json.loads((root / "opencode.json").read_text())
+    assert config["model"] == "rapid-mlx/qwen3.5-9b-4bit"
+    assert "rapid-mlx" in config["providers"]
+    runner = (root / "run").read_text()
+    assert "OPENCODE_CONFIG=" in runner
+    assert "OPENCODE_CONFIG_CONTENT=" in runner
+    assert "opencode --model" not in runner
 
 
 def test_isolated_dry_run_preserves_saved_profile(private_home, capsys):

@@ -313,7 +313,22 @@ def _command(name: str, root: Path, model: str, port: int) -> str:
     if name == "pi":
         return f"{credential} PI_CODING_AGENT_DIR={quote(str(root))} pi --provider rapid-mlx --model {quote(model)}"
     if name == "opencode":
-        return f"{credential} OPENCODE_CONFIG={quote(str(root / 'opencode.json'))} opencode --model rapid-mlx/{quote(model)}"
+        # OpenCode 2.x removed the top-level --model flag. Both supported
+        # config shapes already select the model with the top-level `model` key.
+        # Its config loader also reads and may rewrite the default XDG file.
+        # Give the process a private home. Inline config has precedence over
+        # project config, which would otherwise replace our selected model.
+        config = quote(str(root / "opencode.json"))
+        return (
+            f'{credential} OPENCODE_CONFIG_CONTENT="$(cat {config})" '
+            "env -u OPENCODE_CONFIG_DIR "
+            f"HOME={quote(str(root / 'home'))} "
+            f"XDG_CONFIG_HOME={quote(str(root / 'xdg-config'))} "
+            f"XDG_DATA_HOME={quote(str(root / 'xdg-data'))} "
+            f"XDG_CACHE_HOME={quote(str(root / 'xdg-cache'))} "
+            f"XDG_STATE_HOME={quote(str(root / 'xdg-state'))} "
+            f"OPENCODE_CONFIG={config} opencode"
+        )
     if name == "hermes":
         return f"{credential} HERMES_HOME={quote(str(root))} hermes -p rapid chat --provider custom --model {quote(model)}"
     if name == "goose":
