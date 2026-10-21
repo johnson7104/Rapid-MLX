@@ -12,6 +12,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import pytest
+import yaml
 
 try:
     import tomllib
@@ -95,6 +96,14 @@ def test_saved_port_is_reused_by_later_profiles(private_home):
         / "rapid"
         / "config.yaml"
     ).is_file()
+    assert (
+        isolated.connection_dir()
+        / "agents"
+        / "hermes"
+        / "profiles"
+        / "rapid"
+        / ".rapid-bundled-skills-cleaned"
+    ).is_file()
 
 
 def test_every_runner_refreshes_private_endpoint_after_port_change(private_home):
@@ -102,7 +111,10 @@ def test_every_runner_refreshes_private_endpoint_after_port_change(private_home)
         isolated.configure(name, "qwen3.5-9b-4bit", port=7660)
         runner = (isolated.connection_dir() / "agents" / name / "run").read_text()
         assert f"launch {name} --isolated --check" in runner
-        assert f"launch {name} --isolated --model qwen3.5-9b-4bit" in runner
+        if name == "hermes":
+            assert runner.count("launch hermes --isolated") == 1
+        else:
+            assert f"launch {name} --isolated --model qwen3.5-9b-4bit" in runner
 
 
 def test_old_opencode_shape_and_hermes_auth(private_home):
@@ -126,8 +138,301 @@ def test_old_opencode_shape_and_hermes_auth(private_home):
         / "config.yaml"
     ).read_text()
     assert f'api_key: "{isolated.stable_key()}"' in hermes
+    assert yaml.safe_load(hermes)["platform_toolsets"]["cli"] == ["terminal", "file"]
+    assert (
+        isolated.connection_dir()
+        / "agents"
+        / "hermes"
+        / "profiles"
+        / "rapid"
+        / ".no-bundled-skills"
+    ).is_file()
+    assert not (isolated.connection_dir() / "agents" / "hermes" / "auth.json").exists()
     goose = isolated.configure("goose", "qwen3.5-9b-4bit")
     assert "goose session --provider" in Path(goose).read_text()
+
+
+@pytest.mark.parametrize("cleanup_outcome", ["clean", "timeout", "nonzero", "leftover"])
+def test_existing_private_hermes_skills_are_opted_out(private_home, cleanup_outcome):
+    root = isolated.connection_dir() / "agents" / "hermes"
+    skills = root / "profiles" / "rapid" / "skills"
+    skills.mkdir(parents=True)
+    bundled_skill = skills / "SKILL.md"
+    bundled_skill.write_text("bundled skill")
+    with (
+        patch("rapid_mlx.agents.isolated.shutil.which", return_value="hermes"),
+        patch("rapid_mlx.agents.isolated.subprocess.run") as cleanup,
+    ):
+        if cleanup_outcome == "timeout":
+            cleanup.side_effect = subprocess.TimeoutExpired("hermes", 120)
+        else:
+            cleanup.return_value.returncode = 1 if cleanup_outcome == "nonzero" else 0
+            if cleanup_outcome == "clean":
+                cleanup.side_effect = lambda *_args, **_kwargs: (
+                    bundled_skill.unlink() or cleanup.return_value
+                )
+        for _ in range(2):
+            if cleanup_outcome in {"timeout", "nonzero"}:
+                with pytest.raises(ValueError, match="skill cleanup did not complete"):
+                    isolated.configure("hermes", "qwen3.5-9b-4bit")
+            else:
+                isolated.configure("hermes", "qwen3.5-9b-4bit")
+    assert cleanup.call_count == (2 if cleanup_outcome in {"timeout", "nonzero"} else 1)
+    assert cleanup.call_args.kwargs["env"]["HERMES_HOME"] == str(root)
+    assert (root / "profiles" / "rapid" / ".no-bundled-skills").is_file() == (
+        cleanup_outcome not in {"timeout", "nonzero"}
+    )
+    assert (
+        root / "profiles" / "rapid" / ".rapid-bundled-skills-cleaned"
+    ).is_file() == (cleanup_outcome not in {"timeout", "nonzero"})
+
+
+def test_existing_private_hermes_skills_require_cli(private_home):
+    skills = (
+        isolated.connection_dir()
+        / "agents"
+        / "hermes"
+        / "profiles"
+        / "rapid"
+        / "skills"
+    )
+    skills.mkdir(parents=True)
+    with (
+        patch("rapid_mlx.agents.isolated.shutil.which", return_value=None),
+        pytest.raises(ValueError, match="needs the Hermes CLI"),
+    ):
+        isolated.configure("hermes", "qwen3.5-9b-4bit")
+
+
+def test_hermes_uses_served_context_ceiling_before_opening(private_home):
+    from rapid_mlx.launch.cli import launch_command
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            return None
+
+        def read(self):
+            return json.dumps(
+                {
+                    "data": [
+                        {
+                            "id": "qwen3.5-9b-4bit",
+                            "context_window": 262144,
+                            "max_model_len": 154524,
+                        }
+                    ]
+                }
+            ).encode()
+
+    with (
+        patch("urllib.request.urlopen", return_value=Response()),
+        patch("rapid_mlx.recommendations.physical_ram_gb", return_value=0),
+        patch("rapid_mlx.agents.isolated.connection_status", return_value="ready"),
+        patch("rapid_mlx.launch.cli.subprocess.call", return_value=0) as opened,
+        pytest.raises(SystemExit, match="0"),
+    ):
+        launch_command(_launch_args("hermes", "--model", "qwen3.5-9b-4bit"))
+    config = (
+        isolated.connection_dir()
+        / "agents"
+        / "hermes"
+        / "profiles"
+        / "rapid"
+        / "config.yaml"
+    ).read_text()
+    assert yaml.safe_load(config)["model"]["context_length"] == 131072
+    opened.assert_called_once()
+
+
+def test_hermes_rejects_served_window_below_minimum(private_home, capsys):
+    from rapid_mlx.launch.cli import launch_command
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            return None
+
+        def read(self):
+            return b'{"data":[{"id":"small","context_window":32768,"max_model_len":32768}]}'
+
+    with (
+        patch("urllib.request.urlopen", return_value=Response()),
+        patch("rapid_mlx.recommendations.physical_ram_gb", return_value=0),
+        patch("rapid_mlx.launch.cli.subprocess.call") as opened,
+        pytest.raises(SystemExit, match="1"),
+    ):
+        launch_command(_launch_args("hermes", "--model", "small"))
+    assert "at least 64,000" in capsys.readouterr().err
+    opened.assert_not_called()
+
+
+def test_hermes_requires_live_limit_at_launch(private_home, capsys):
+    from rapid_mlx.launch.cli import launch_command
+
+    with (
+        patch(
+            "rapid_mlx.agents.isolated.hermes_context_length",
+            side_effect=[64_000, ValueError("model card has no context limit")],
+        ),
+        patch("rapid_mlx.agents.isolated.connection_status", return_value="ready"),
+        patch("rapid_mlx.recommendations.physical_ram_gb", return_value=0),
+        patch("rapid_mlx.launch.cli.subprocess.call") as opened,
+        pytest.raises(SystemExit, match="1"),
+    ):
+        launch_command(_launch_args("hermes", "--model", "qwen3.5-9b-4bit"))
+    assert "model card has no context limit" in capsys.readouterr().err
+    opened.assert_not_called()
+
+
+def test_hermes_uses_cached_window_only_while_server_is_stopped(private_home):
+    with (
+        patch("urllib.request.urlopen", side_effect=ConnectionRefusedError()),
+        patch("rapid_mlx.run.cli._cached_context_window", return_value=262144),
+    ):
+        assert isolated.hermes_context_length(7660, "a" * 64, "model") == 131072
+        with pytest.raises(ValueError, match="ready local server"):
+            isolated.hermes_context_length(7660, "a" * 64, "model", require_live=True)
+
+
+def test_hermes_ignores_unrelated_single_model_listing(private_home):
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            return None
+
+        def read(self):
+            return b'{"data":[{"id":"another-model","context_window":32768,"max_model_len":32768}]}'
+
+    with (
+        patch("urllib.request.urlopen", return_value=Response()),
+        patch("rapid_mlx.run.cli._cached_context_window", return_value=262144),
+    ):
+        assert isolated.hermes_context_length(7660, "a" * 64, "wanted-model") == 131072
+        with pytest.raises(ValueError, match="ready local server"):
+            isolated.hermes_context_length(
+                7660, "a" * 64, "wanted-model", require_live=True
+            )
+
+
+def test_hermes_failed_preflight_stops_only_new_server(private_home):
+    from rapid_mlx.launch.cli import launch_command
+
+    with (
+        patch(
+            "rapid_mlx.agents.isolated.hermes_context_length",
+            side_effect=[64_000, ValueError("served limit too short")],
+        ),
+        patch(
+            "rapid_mlx.agents.isolated.connection_status",
+            side_effect=["stopped", "ready"],
+        ),
+        patch("rapid_mlx.recommendations.physical_ram_gb", return_value=0),
+        patch("rapid_mlx.run.cli._confirm_download", return_value=True),
+        patch("rapid_mlx.launch.cli._start_server_background", return_value=12345),
+        patch("rapid_mlx.launch.cli._stop_failed_start") as stopped,
+        patch("rapid_mlx.launch.cli.subprocess.call") as opened,
+        pytest.raises(SystemExit, match="1"),
+    ):
+        launch_command(
+            _launch_args(
+                "hermes",
+                "--isolated",
+                "--run",
+                "--start-server",
+                "--model",
+                "qwen3.5-9b-4bit",
+            )
+        )
+    stopped.assert_called_once_with(12345)
+    opened.assert_not_called()
+
+
+def test_hermes_check_refreshes_only_from_live_served_limit(private_home):
+    from rapid_mlx.launch.cli import launch_command
+
+    isolated.stable_key()
+    with (
+        patch("rapid_mlx.agents.isolated.connection_status", return_value="ready"),
+        patch(
+            "rapid_mlx.agents.isolated.hermes_context_length", return_value=98304
+        ) as probe,
+    ):
+        launch_command(
+            _launch_args(
+                "hermes", "--isolated", "--check", "--model", "qwen3.5-9b-4bit"
+            )
+        )
+    assert probe.call_args.kwargs["require_live"] is True
+    config = (
+        isolated.connection_dir()
+        / "agents"
+        / "hermes"
+        / "profiles"
+        / "rapid"
+        / "config.yaml"
+    ).read_text()
+    assert yaml.safe_load(config)["model"]["context_length"] == 98304
+
+
+def test_hermes_live_configuration_probes_once(private_home):
+    with patch(
+        "rapid_mlx.agents.isolated.hermes_context_length", return_value=98304
+    ) as probe:
+        isolated.configure("hermes", "model", port=7660, require_live_context=True)
+    probe.assert_called_once()
+    assert probe.call_args.kwargs["require_live"] is True
+    config = (
+        isolated.connection_dir()
+        / "agents"
+        / "hermes"
+        / "profiles"
+        / "rapid"
+        / "config.yaml"
+    ).read_text()
+    assert yaml.safe_load(config)["model"]["context_length"] == 98304
+
+
+def test_hermes_live_check_rejects_missing_served_ceiling(private_home):
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            return None
+
+        def read(self):
+            return b'{"data":[{"id":"model","context_window":262144}]}'
+
+    with (
+        patch("urllib.request.urlopen", return_value=Response()),
+        pytest.raises(ValueError, match="ready local server"),
+    ):
+        isolated.hermes_context_length(7660, "a" * 64, "model", require_live=True)
+
+
+def test_hermes_saved_runner_check_stops_on_missing_limit(private_home, capsys):
+    from rapid_mlx.launch.cli import launch_command
+
+    isolated.stable_key()
+    with (
+        patch("rapid_mlx.agents.isolated.connection_status", return_value="ready"),
+        patch(
+            "rapid_mlx.agents.isolated.hermes_context_length",
+            side_effect=ValueError("served limit unavailable"),
+        ),
+        pytest.raises(SystemExit, match="1"),
+    ):
+        launch_command(
+            _launch_args("hermes", "--isolated", "--check", "--model", "model")
+        )
+    assert "served limit unavailable" in capsys.readouterr().err
 
 
 def test_isolated_dry_run_preserves_saved_profile(private_home, capsys):

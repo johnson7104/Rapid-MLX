@@ -9,6 +9,7 @@ import secrets
 import shlex
 import shutil
 import stat
+import subprocess
 import sys
 import urllib.error
 import urllib.request
@@ -32,6 +33,8 @@ SUPPORTED = frozenset(
     }
 )
 _API_KEY_ENV = "RAPID_MLX_API_KEY"
+_HERMES_MIN_CONTEXT = 64_000
+_HERMES_MAX_CONTEXT = 131_072
 
 
 def connection_dir() -> Path:
@@ -148,6 +151,70 @@ def connection_status(port: int, key: str, model: str) -> str:
     return "ready" if model in advertised else "model-mismatch"
 
 
+def hermes_context_length(
+    port: int, key: str, model: str, *, require_live: bool = False
+) -> int:
+    """Use the served KV budget for Hermes, bounded by the native window.
+
+    A stopped server can be configured provisionally from cached model metadata.
+    The launch path calls this again after readiness, before starting Hermes.
+    """
+    context = None
+    request = urllib.request.Request(
+        f"http://127.0.0.1:{port}/v1/models",
+        headers={"Authorization": f"Bearer {key}"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=2) as response:
+            payload = json.loads(response.read())
+        models = payload.get("data") if isinstance(payload, dict) else None
+        if isinstance(models, list):
+            entry = next(
+                (
+                    item
+                    for item in models
+                    if isinstance(item, dict) and item.get("id") == model
+                ),
+                None,
+            )
+            if entry is not None:
+                from rapid_mlx.agents.adapter import _valid_context_window
+
+                native = _valid_context_window(entry.get("context_window"))
+                served = _valid_context_window(entry.get("max_model_len"))
+                if served is not None or (native is not None and not require_live):
+                    context = min(
+                        *(
+                            value
+                            for value in (served, native, _HERMES_MAX_CONTEXT)
+                            if value is not None
+                        )
+                    )
+    except (urllib.error.URLError, OSError, TimeoutError, ValueError, TypeError):
+        pass
+    if context is None and not require_live:
+        from rapid_mlx.run.cli import _cached_context_window
+
+        context = _cached_context_window(model)
+        if context is not None:
+            context = min(context, _HERMES_MAX_CONTEXT)
+    if context is None:
+        if require_live:
+            raise ValueError(
+                f"Hermes needs a context limit from the ready local server for {model}; "
+                "check /v1/models and retry."
+            )
+        # A server started by launch is probed again before the agent opens.
+        return _HERMES_MIN_CONTEXT
+    if context < _HERMES_MIN_CONTEXT:
+        raise ValueError(
+            f"Hermes needs at least {_HERMES_MIN_CONTEXT:,} context tokens, "
+            f"but {model} can serve only {context:,}. Choose a 64K-capable model "
+            "such as qwen3.5-9b-4bit or raise the server context limit."
+        )
+    return context
+
+
 def _cli_invocation() -> str:
     current = Path(sys.argv[0])
     if current.name == "rapid-mlx" and current.is_file():
@@ -186,7 +253,13 @@ def _command(name: str, root: Path, model: str, port: int) -> str:
     raise ValueError(f"unsupported isolated agent: {name}")
 
 
-def configure(name: str, model: str, *, port: int | None = None) -> str:
+def configure(
+    name: str,
+    model: str,
+    *,
+    port: int | None = None,
+    require_live_context: bool = False,
+) -> str:
     """Render an existing registry profile under Rapid's private directory."""
     profile = get_profile(name)
     if profile is None or profile.name not in SUPPORTED:
@@ -204,11 +277,18 @@ def configure(name: str, model: str, *, port: int | None = None) -> str:
     os.environ["RAPID_MLX_API_KEY"] = key
     try:
         version = None
+        context_length = None
         if name == "opencode":
             from rapid_mlx.agents.opencode_version import installed_version
 
             version = installed_version()
-        rendered = profile.render_config(base, model, version)
+        if name == "hermes":
+            context_length = hermes_context_length(
+                port, key, model, require_live=require_live_context
+            )
+        rendered = profile.render_config(
+            base, model, version, context_length=context_length
+        )
     finally:
         if previous is None:
             os.environ.pop("RAPID_MLX_API_KEY", None)
@@ -233,7 +313,60 @@ def configure(name: str, model: str, *, port: int | None = None) -> str:
     elif name == "opencode":
         _private_write(root / "opencode.json", str(rendered))
     elif name == "hermes":
-        rendered = str(rendered).replace(
+        import yaml
+
+        # Keep this private profile lean without changing the user's Hermes home.
+        profile_root = root / "profiles" / "rapid"
+        marker = profile_root / ".no-bundled-skills"
+        cleaned = profile_root / ".rapid-bundled-skills-cleaned"
+        _reject_symlinked_ancestors(marker)
+        _reject_symlinked_ancestors(cleaned)
+        if not cleaned.is_file():
+            skills_dir = profile_root / "skills"
+            _reject_symlinked_ancestors(skills_dir)
+            if skills_dir.is_dir():
+                if not shutil.which("hermes"):
+                    raise ValueError(
+                        "Hermes private skill cleanup needs the Hermes CLI; install it and retry launch."
+                    )
+                # Hermes removes only its own unmodified bundled skills.
+                try:
+                    result = subprocess.run(
+                        [
+                            "hermes",
+                            "-p",
+                            "rapid",
+                            "skills",
+                            "opt-out",
+                            "--remove",
+                            "--yes",
+                        ],
+                        env={**os.environ, "HERMES_HOME": str(root)},
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        timeout=120,
+                        check=False,
+                    )
+                except (OSError, subprocess.TimeoutExpired):
+                    result = None
+                if result is not None and result.returncode == 0:
+                    _private_write(
+                        cleaned,
+                        "Bundled skills opt-out completed for private profile.\n",
+                    )
+                else:
+                    raise ValueError(
+                        "Hermes private skill cleanup did not complete; retry launch."
+                    )
+            elif not skills_dir.is_dir():
+                _private_write(
+                    cleaned, "Private profile started without bundled skills.\n"
+                )
+        if not marker.is_file():
+            _private_write(marker, "Private local profile: no bundled skills.\n")
+        hermes_config = yaml.safe_load(str(rendered))
+        hermes_config["platform_toolsets"] = {"cli": ["terminal", "file"]}
+        rendered = yaml.safe_dump(hermes_config, sort_keys=False).replace(
             "  base_url: ", f'  api_key: "{key}"\n  base_url: ', 1
         )
         _private_write(root / "profiles" / "rapid" / "config.yaml", str(rendered))
@@ -265,8 +398,12 @@ def configure(name: str, model: str, *, port: int | None = None) -> str:
     # A different Desktop session may have chosen a new free port or rotated
     # the key. Refresh the private config only after the shared route validates.
     refresh = (
-        f"{cli} launch {shlex.quote(name)} --isolated "
-        f"--model {shlex.quote(model)} >/dev/null || exit 1\n"
+        ""
+        if name == "hermes"
+        else (
+            f"{cli} launch {shlex.quote(name)} --isolated "
+            f"--model {shlex.quote(model)} >/dev/null || exit 1\n"
+        )
     )
     _private_write(
         runner,
