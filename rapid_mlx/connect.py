@@ -1,12 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """Single source of truth (SSOT) for "Ready:" / "Connect:" server output.
 
-The "server is up, now point your tools at it" experience is fragmented:
-the shared post-bind startup seam prints a ``Ready:`` line, ``agents --setup`` writes a
-tool-specific config, and the desktop app separately assembles its own
-endpoint URLs. Any change to one is invisible to the others, so a user who
-copies the banner URL into a config gets subtly different paths than the
-one the desktop shows.
+The shared post-bind startup seam prints a ``Ready:`` line, coding agents use
+``rapid-mlx launch <agent>`` with private profiles, and the desktop app
+assembles endpoint URLs. This module keeps the displayed addresses consistent.
 
 This module owns the *shape* of every endpoint and its human/machine
 rendering. Both the serve banner and ``rapid-mlx connect`` render from the
@@ -33,8 +30,22 @@ from __future__ import annotations
 
 import json
 import shlex
+import shutil
+import sys
 from dataclasses import dataclass
 from typing import Any
+
+
+def package_install_command(package: str, *, no_deps: bool = False) -> str:
+    """Install into this CLI's Python with uv when it is available."""
+    python = shlex.quote(sys.executable)
+    prefix = (
+        f"uv pip install --python {python}"
+        if shutil.which("uv")
+        else f"{python} -m pip install"
+    )
+    option = " --no-deps" if no_deps else ""
+    return f"{prefix}{option} {shlex.quote(package)}"
 
 
 def _authority(host: str) -> str:
@@ -133,17 +144,10 @@ class ServerEndpoints:
         return json.dumps(self.to_dict(), indent=2, ensure_ascii=False)
 
 
-# The ``--setup`` verbs printed in the human banner's "Connect:" section.
-# Each row is ``(app label, command prefix, OpenAI endpoint?)``. Every row —
-# including ``openai-python`` — takes an OpenAI-style ``/v1`` base URL and
-# gets ``--base-url <url>`` appended so the copied command targets the
-# *actual* running server, not the localhost:8000 default the standalone
-# process would otherwise assume (#2348). ``connect`` accepts ``--base-url``
-# as the explicit way to receive that instance context, so the pasted command
-# resolves the real host/port/model instead of printing placeholders.
+# The agent launcher starts its own private server. The Python row connects to
+# this running server and therefore carries its actual OpenAI endpoint.
 _CONNECT_ROWS: list[tuple[str, str, bool]] = [
-    ("Claude Code", "rapid-mlx agents claude-code --setup", True),
-    ("Continue", "rapid-mlx agents continue --setup", True),
+    ("Coding agent", "rapid-mlx launch codex", False),
     ("Python", "rapid-mlx connect openai-python", True),
 ]
 
@@ -227,7 +231,17 @@ def render_serve_next(ep: ServerEndpoints, *, api_key: str | None = None) -> str
     from rapid_mlx.agents import get_profile
 
     agents = [
-        name for name in ("opencode", "claude-code", "codex") if get_profile(name)
+        name
+        for name in (
+            "codex",
+            "claude-code",
+            "opencode",
+            "pi",
+            "hermes",
+            "crush",
+            "goose",
+        )
+        if get_profile(name)
     ]
     python_key = (
         '__import__("os").environ["RAPID_MLX_API_KEY"]'
@@ -239,23 +253,20 @@ def render_serve_next(ep: ServerEndpoints, *, api_key: str | None = None) -> str
         lines.append("    Set RAPID_MLX_API_KEY to the server key first.")
     lines.append(f"    {curl}")
     if agents:
-        lines.append("    Connect a coding agent (choose one):")
-        lines.extend(
-            f"      rapid-mlx agents {agent} --setup --base-url {shlex.quote(ep.openai_url)}"
-            for agent in agents
+        lines.append(
+            "    Launch a coding agent with its own local server (choose one):"
         )
-        lines.append("    Full list: rapid-mlx agents")
+        lines.extend(f"      rapid-mlx launch {agent}" for agent in agents)
     else:
         lines.extend(
             [
-                "    Connect a coding agent: rapid-mlx agents",
-                "    List agents: rapid-mlx agents",
+                "    Coding agent: rapid-mlx launch codex",
             ]
         )
     lines.extend(
         [
             f"    OpenAI SDK base_url: {ep.openai_url}; model: {ep.model}",
-            "    Python (pip install openai):",
+            f"    Python ({package_install_command('openai')}):",
             "      from openai import OpenAI",
             f"      client = OpenAI(base_url={ep.openai_url!r}, api_key={python_key})",
             f"      print(client.chat.completions.create(model={ep.model!r}, messages=[{{'role': 'user', 'content': 'Hello!'}}]).choices[0].message.content)",

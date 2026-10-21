@@ -8490,7 +8490,9 @@ def _run_submit_flow(
                 )
                 # Match the validated runtime used by the vision extra and
                 # packaged app so every recovery path installs the same lane.
-                print("    pip install --no-deps 'mlx-vlm==0.7.2'")
+                from rapid_mlx.connect import package_install_command
+
+                print("   ", package_install_command("mlx-vlm==0.7.2", no_deps=True))
                 print()
             else:
                 print(f"  Error loading model: {e}")
@@ -13825,8 +13827,11 @@ def agents_command(args):
             )
         else:
             print(f"  {agent_count} {agents_label} supported")
-        print("  Usage: rapid-mlx agents <name>          Show setup guide")
-        print("         rapid-mlx agents <name> --setup   Auto-configure")
+        print(
+            "  Usage: rapid-mlx launch <agent>         Start a private local coding agent"
+        )
+        print("         rapid-mlx agents <name>          Show manual setup guide")
+        print("         rapid-mlx agents <name> --setup   Configure other integrations")
         print("         rapid-mlx agents <name> --test    Run integration tests")
         print()
         return
@@ -14154,7 +14159,9 @@ def _connect_target(args, eps):
         print()
         print(f"  Python (OpenAI SDK)  →  {eps.openai_url}")
         print()
-        print("      pip install openai")
+        from rapid_mlx.connect import package_install_command
+
+        print("     ", package_install_command("openai"))
         print()
         print("      from openai import OpenAI")
         print(f"      client = OpenAI(base_url={eps.openai_url!r}, api_key='sk-noop')")
