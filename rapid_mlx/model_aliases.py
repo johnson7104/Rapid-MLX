@@ -1050,7 +1050,7 @@ def external_model_root_paths() -> list[str]:
     return roots
 
 
-def resolve_model(name: str) -> str:
+def resolve_model(name: str, *, include_external_roots: bool = True) -> str:
     """Resolve a model alias to its full HuggingFace path.
 
     If a local file/directory with the name exists, prefer that — unless it
@@ -1063,6 +1063,12 @@ def resolve_model(name: str) -> str:
     If name is a retired, known-broken alias, raise before any download or load.
     If name matches an alias, return the mapped HF path.
     Otherwise return unchanged.
+
+    ``include_external_roots=False`` resolves to the Hub identity only.
+    Commands that download into or delete from the Hugging Face cache
+    (``pull``, ``rm``) must never be handed an external folder: the
+    downloader would reject a filesystem path as a repo id, and the cache
+    would not contain it.
     """
     if os.path.exists(name) and not local_dir_shadows_alias(name):
         return name
@@ -1079,7 +1085,7 @@ def resolve_model(name: str) -> str:
     # Preserve the historical resolver hot path exactly unless the external
     # roots are available. In particular, ordinary chat/serve resolution
     # must not introduce a cache/download-gate probe.
-    if not external_model_root_paths():
+    if not include_external_roots or not external_model_root_paths():
         if "/" in name:
             canonical = _alias_for_hf_path(name)
             if canonical is not None:
@@ -1101,6 +1107,15 @@ def resolve_model(name: str) -> str:
         return external
     profile = _load().get(name)
     return profile.hf_path if profile is not None else _imported_or(name)
+
+
+def resolve_hub_model(name: str) -> str:
+    """Resolve ``name`` for commands that manage the Hugging Face cache.
+
+    Same as :func:`resolve_model` but never returns a model found in an
+    external model folder: ``pull`` and ``rm`` act on the Hub repo id.
+    """
+    return resolve_model(name, include_external_roots=False)
 
 
 def _imported_or(name: str) -> str:

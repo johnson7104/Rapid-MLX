@@ -11233,6 +11233,11 @@ def _pinned_checkpoint_revision(repo_id: str) -> str | None:
     return IMAGE_MODEL_REVISIONS.get(repo_id) or WAN_REVISIONS.get(repo_id)
 
 
+# Commands that download into or delete from the Hugging Face cache. They
+# operate on the Hub repo id, never on a model found in an external folder.
+_HF_CACHE_COMMANDS = frozenset({"pull", "rm"})
+
+
 def pull_command(args):
     """Download a model and prepare every catalog-declared requirement."""
 
@@ -11258,9 +11263,9 @@ def pull_command(args):
     primary_args = args
     # ``main()`` normally resolves aliases before dispatch, but keep this
     # data-only security boundary fail-closed for direct/internal calls too.
-    from rapid_mlx.model_aliases import resolve_model
+    from rapid_mlx.model_aliases import resolve_hub_model
 
-    resolved_primary = resolve_model(primary_repo)
+    resolved_primary = resolve_hub_model(primary_repo)
     if resolved_primary in IMAGE_MODEL_DATA_FILES and resolved_primary != primary_repo:
         primary_args = copy.copy(args)
         primary_args._original_alias = (
@@ -15088,7 +15093,11 @@ def main():
             resolved_model_ref,
             validate_local_model_for_serve,
         )
-        from rapid_mlx.model_aliases import RetiredModelAliasError, resolve_model
+        from rapid_mlx.model_aliases import (
+            RetiredModelAliasError,
+            resolve_hub_model,
+            resolve_model,
+        )
         from rapid_mlx.model_load_errors import InvalidModelConfig
         from rapid_mlx.user_aliases import UserAliasError
 
@@ -15100,7 +15109,10 @@ def main():
                 args.model = resolved_model_ref(args.model)
                 resolved = args.model
             raise_if_missing_local_model(args.model)
-            resolved = resolve_model(args.model)
+            if getattr(args, "command", None) in _HF_CACHE_COMMANDS:
+                resolved = resolve_hub_model(args.model)
+            else:
+                resolved = resolve_model(args.model)
             if getattr(args, "command", None) == "serve":
                 validating_local_model = True
                 validate_local_model_for_serve(resolved)
