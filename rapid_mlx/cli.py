@@ -3162,6 +3162,54 @@ def _alias_mtp_declaration(model_name) -> tuple[str | None, int | None]:
     return sidecar, depth
 
 
+def _cached_mtp_sidecar(sidecar: str) -> str | None:
+    """Resolve an automatic sidecar locally, honoring its catalog revision.
+
+    A sidecar can contain only the MTP head, so it need not satisfy the
+    complete target-checkpoint contract. Require the weight file consumed
+    by the injector, and pass the directory to prevent a later Hub lookup.
+    """
+    from pathlib import Path
+
+    from .model_aliases import checkpoint_prefix
+    from .model_metadata import _cached_file, resolve_unreferenced_cached_snapshot
+    from .spec_decode.mtp.qwen3_5_inject import _find_mtp_weights_file
+
+    names = (
+        "mtp.safetensors",
+        "model-mtp.safetensors",
+        "mtp/model.safetensors",
+        "model.safetensors",
+    )
+    try:
+        prefix = checkpoint_prefix(sidecar)
+        root: Path | None = None
+        for name in names:
+            weight = _cached_file(sidecar, f"{prefix}{name}")
+            if weight is not None:
+                root = (
+                    weight.parent.parent if name.startswith("mtp/") else weight.parent
+                )
+                break
+        if root is None:
+            # This resolver already returns the checkpoint subfolder, and
+            # enforces catalog pins without requiring refs/main.
+            root = resolve_unreferenced_cached_snapshot(sidecar)
+        if root is None:
+            return None
+        # Use exactly the injector's first existing candidate. Skipping an
+        # empty/unreadable head could select trunk weights instead, and the
+        # injector would still open the unusable higher-priority head.
+        selected = _find_mtp_weights_file(root)
+        if selected is not None and selected.is_file() and selected.stat().st_size > 0:
+            return str(root)
+    except OSError:
+        # The injector would fail on this same probe; automatic MTP must yield
+        # to plain decode rather than mask the failure with a later candidate.
+        return None
+    return None
+
+
 def _alias_continuous_mtp_tier(model_name) -> str:
     """Return the alias's measured continuous-MTP qualification tier.
 
@@ -3707,9 +3755,11 @@ def _normalize_speculative_config_or_exit(args):
             ):
                 if hf_cfg is None:
                     profile = resolve_profile(args.model)
-                    pin = getattr(
-                        profile, "tensorfold_target_revision", None
-                    ) or getattr(profile, "dflash_target_revision", None)
+                    pin = (
+                        profile.revision
+                        or getattr(profile, "tensorfold_target_revision", None)
+                        or getattr(profile, "dflash_target_revision", None)
+                    )
                     _, reason = _resolve_cached_hf_config(profile.hf_path, pin)
                     reason = reason or "cached target config could not be read"
                 else:
@@ -3721,8 +3771,19 @@ def _normalize_speculative_config_or_exit(args):
                     file=sys.stderr,
                 )
             else:
-                raw_config = '{"method":"mtp"}'
-                args.speculative_config = raw_config
+                sidecar, _ = _alias_mtp_declaration(args.model)
+                cached_sidecar = _cached_mtp_sidecar(sidecar) if sidecar else None
+                if sidecar and cached_sidecar is None:
+                    print(
+                        "Automatic MTP skipped: sidecar is not cached; "
+                        f"run `rapid-mlx pull {args.model}` and "
+                        f"`rapid-mlx pull {sidecar}` to cache both; "
+                        "using plain decode.",
+                        file=sys.stderr,
+                    )
+                else:
+                    raw_config = json.dumps({"method": "mtp", "model": cached_sidecar})
+                    args.speculative_config = raw_config
 
     if raw_config is None:
         _fill_runtime_defaults(overwrite=False)
