@@ -367,6 +367,8 @@ class ModelProfile:
     # agentic sampling; literal false records a measured model-side inability.
     # This is harness metadata only and does not alter serving or parser routing.
     agentic_coverage: bool = True
+    # Optional immutable checkpoint; lowercase full 40-hex Hub commit SHA.
+    revision: str | None = None
 
     @property
     def speedup_dict(self) -> dict[str, float]:

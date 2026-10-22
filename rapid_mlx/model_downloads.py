@@ -78,6 +78,17 @@ def snapshot_download(repo_id: str, **kwargs: Any) -> str:
     from huggingface_hub import snapshot_download as hub_snapshot_download
     from huggingface_hub.errors import LocalEntryNotFoundError
 
+    from .model_aliases import resolve_hub_model, resolve_revision
+
+    if (revision := resolve_revision(repo_id)) is not None:
+        requested = kwargs.get("revision")
+        if requested is not None and requested != revision:
+            raise ValueError(
+                f"{repo_id} is pinned to revision {revision}; "
+                f"cannot download conflicting revision {requested}"
+            )
+        kwargs["revision"] = revision
+        repo_id = resolve_hub_model(repo_id)
     if not disabled():
         return str(hub_snapshot_download(repo_id, **kwargs))
     local_kwargs = dict(kwargs)
@@ -93,6 +104,17 @@ def hf_hub_download(repo_id: str, filename: str, **kwargs: Any) -> str:
     from huggingface_hub import hf_hub_download as hub_file_download
     from huggingface_hub.errors import LocalEntryNotFoundError
 
+    from .model_aliases import resolve_hub_model, resolve_revision
+
+    if (revision := resolve_revision(repo_id)) is not None:
+        requested = kwargs.get("revision")
+        if requested is not None and requested != revision:
+            raise ValueError(
+                f"{repo_id} is pinned to revision {revision}; "
+                f"cannot download conflicting revision {requested}"
+            )
+        kwargs["revision"] = revision
+        repo_id = resolve_hub_model(repo_id)
     if not disabled():
         return str(hub_file_download(repo_id, filename, **kwargs))
     local_kwargs = dict(kwargs)

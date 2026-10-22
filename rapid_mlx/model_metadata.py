@@ -201,6 +201,11 @@ def _looks_like_hub_repo_id(model_name: str) -> bool:
 
 def _cached_file(model_name: str, filename: str) -> Path | None:
     """Resolve a cache file through huggingface_hub without network access."""
+    from .model_aliases import resolve_hub_model, resolve_revision
+
+    revision = resolve_revision(model_name)
+    if revision is not None:
+        model_name = resolve_hub_model(model_name)
     if not _looks_like_hub_repo_id(model_name):
         return None
     try:
@@ -208,7 +213,9 @@ def _cached_file(model_name: str, filename: str) -> Path | None:
     except ImportError:
         return None
     try:
-        cached = try_to_load_from_cache(model_name, filename)
+        cached = try_to_load_from_cache(
+            model_name, filename, **({"revision": revision} if revision else {})
+        )
     except Exception:
         return None
     if (
@@ -266,8 +273,27 @@ def _complete_cached_checkpoint(
         return None
 
 
+def resolve_pinned_cached_snapshot(model_name: str) -> Path | None:
+    """Return only the catalog's complete immutable checkpoint, never main."""
+    from huggingface_hub.constants import HF_HUB_CACHE
+
+    from .model_aliases import resolve_hub_model, resolve_revision
+
+    revision = resolve_revision(model_name)
+    if revision is None:
+        return None
+    repo_id = resolve_hub_model(model_name)
+    repo_root = Path(HF_HUB_CACHE) / ("models--" + repo_id.replace("/", "--"))
+    return _complete_cached_checkpoint(
+        repo_root, repo_root / "snapshots" / revision, model_name
+    )
+
+
 def resolve_unreferenced_cached_snapshot(model_name: str) -> Path | None:
     """Return one complete cached checkpoint when no Hub ref resolves it.
+
+    Catalog pins instead select only their exact snapshot, regardless of refs
+    or other cached revisions.
 
     ``snapshot_download(..., revision=<commit>)`` materializes
     ``snapshots/<commit>/`` but intentionally does not update ``refs/main``.
@@ -282,6 +308,10 @@ def resolve_unreferenced_cached_snapshot(model_name: str) -> Path | None:
     the normal online/default-ref behavior instead of guessing which revision
     the user intended.
     """
+    from .model_aliases import resolve_revision
+
+    if resolve_revision(model_name) is not None:
+        return resolve_pinned_cached_snapshot(model_name)
     if not _looks_like_hub_repo_id(model_name):
         return None
     try:
@@ -353,11 +383,17 @@ def resolve_unreferenced_cached_subfolder(
 def resolve_offline_cached_snapshot(model_name: str) -> Path | None:
     """Return the sole complete local revision behind an incomplete main ref.
 
+    Catalog pins always select their exact complete snapshot, including online.
+
     This is intentionally narrower than ordinary Hub resolution. It is active
     only in explicit offline mode, requires ``refs/main`` to select an
     incomplete snapshot, never mutates that ref, and refuses ambiguity when
     more than one complete immutable revision remains in the cache.
     """
+    from .model_aliases import resolve_revision
+
+    if resolve_revision(model_name) is not None:
+        return resolve_pinned_cached_snapshot(model_name)
     if not hub_offline_mode_active() or not _looks_like_hub_repo_id(model_name):
         return None
     try:
