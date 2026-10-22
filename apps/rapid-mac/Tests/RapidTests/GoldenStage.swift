@@ -1,6 +1,7 @@
 import AppKit
 import SwiftUI
 import Testing
+@testable import Rapid
 
 /// In-process stage for golden-flow tests: mounts a real SwiftUI view in a
 /// window the user never sees and drives it through the same accessibility
@@ -223,12 +224,51 @@ final class GoldenStage {
         Self.turnRunLoop()
     }
 
+    /// Deliver Return through the mounted composer's real text delegate.
+    /// This reaches the readiness gate even when the Send button is disabled.
+    func submitComposer() throws {
+        func findEditor(in view: NSView) -> NSTextView? {
+            if let editor = view as? NSTextView,
+               editor.accessibilityIdentifier() == AutosizingTextView.composeAccessibilityIdentifier {
+                return editor
+            }
+            return view.subviews.lazy.compactMap { findEditor(in: $0) }.first
+        }
+        guard let editor = findEditor(in: host),
+              editor.delegate?.textView?(editor, doCommandBy: #selector(NSResponder.insertNewline(_:))) == true else {
+            throw StageError(description: "submitComposer: composer did not handle Return")
+        }
+        Self.turnRunLoop()
+    }
+
     func value(of identifier: String) -> String? {
         guard let node = findNode(identifier) else { return nil }
         let sel = NSSelectorFromString("accessibilityValue")
         guard node.responds(to: sel), let result = node.perform(sel) else { return nil }
         return result.takeUnretainedValue() as? String
     }
+
+    func help(of identifier: String) -> String? {
+        guard let node = findNode(identifier) else { return nil }
+        let selector = NSSelectorFromString("accessibilityHelp")
+        guard node.responds(to: selector), let result = node.perform(selector) else { return nil }
+        return result.takeUnretainedValue() as? String
+    }
+
+    /// Screen-space frame of a node, as an assistive client reads it — the
+    /// geometry a layout journey asserts on ("Send is inside the window").
+    func frame(of identifier: String) -> CGRect? {
+        guard let node = findNode(identifier) else { return nil }
+        let sel = NSSelectorFromString("accessibilityFrame")
+        guard node.responds(to: sel) else { return nil }
+        // NSRect-returning — same typed-IMP treatment as `press(_:)`.
+        typealias FrameIMP = @convention(c) (NSObject, Selector) -> NSRect
+        let imp = unsafeBitCast(node.method(for: sel), to: FrameIMP.self)
+        return imp(node, sel)
+    }
+
+    /// Screen-space frame of the stage's own window.
+    var windowFrame: CGRect { window.frame }
 
     // MARK: - Scrolling
 

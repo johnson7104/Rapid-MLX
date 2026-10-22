@@ -2,6 +2,86 @@
   "sourceLanguage" : "en",
   "version" : "1.0",
   "strings" : {
+    "Resumes the download using available cached data." : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "使用可用的缓存数据继续下载。"
+          }
+        }
+      }
+    },
+    "Resume the download to chat…" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "继续下载后即可聊天…"
+          }
+        }
+      }
+    },
+    "Stop download of %@": {
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "停止下载 %@"
+          }
+        }
+      }
+    },
+    "Stop download. Cached files are kept for continuing later.": {
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "停止下载。保留缓存文件，以便稍后继续。"
+          }
+        }
+      }
+    },
+    "Stops the download without deleting cached files. Continuing reuses available cached data.": {
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "停止下载但保留缓存文件。继续下载时会复用可用的缓存数据。"
+          }
+        }
+      }
+    },
+    "Stop download": {
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "停止下载"
+          }
+        }
+      }
+    },
+    "Resume download": {
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "继续下载"
+          }
+        }
+      }
+    },
+    "Download stopped": {
+      "localizations": {
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "下载已停止"
+          }
+        }
+      }
+    },
     "Text size" : {
       "localizations" : {
         "zh-Hans" : {
@@ -17149,6 +17229,56 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "你的 AI\n在这台 Mac 上运行。"
+          }
+        }
+      }
+    },
+    "Downloading the model…" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "正在下载模型…"
+          }
+        }
+      }
+    },
+    "%@ of %@" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%1$@ / %2$@"
+          }
+        }
+      }
+    },
+    "%@ downloaded" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "已下载 %@"
+          }
+        }
+      }
+    },
+    "You can type while the model gets ready…" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "模型准备期间可以先输入…"
+          }
+        }
+      }
+    },
+    "Private AI, right on your Mac." : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "私密的 AI，就在你的 Mac 上。"
           }
         }
       }

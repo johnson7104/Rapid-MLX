@@ -775,6 +775,10 @@ struct ContentView: View {
             // progress visible whichever sidebar destination is selected.
             DownloadStrip(
                 downloads: downloads,
+                composerOwnedAlias: section == .chat && !quickstartVisible
+                    && ContentView.mainAreaBranch(for: server.state) == .chat
+                    && ComposerLoadStatus.ownsDownload(readiness: readiness, status: downloads.job(for: alias)?.status)
+                    ? alias : nil,
                 isResident: { alias in
                     if server.residency.contains(alias) { return true }
                     if case .ready(let readyAlias) = server.state { return readyAlias == alias }
@@ -1093,7 +1097,10 @@ struct ContentView: View {
         ModelReadiness.ProgressSnapshot(
             activity: progress.startupActivity,
             subtitle: progress.progressSubtitle,
-            fraction: progress.progressFraction
+            fraction: progress.progressFraction,
+            bytesDownloaded: progress.hasDiskObservation ? progress.bytesDownloaded : nil,
+            totalBytes: progress.totalBytes,
+            etaText: progress.etaText
         )
     }
 
@@ -1442,6 +1449,7 @@ struct ContentView: View {
                 alias: $alias,
                 knownNonChatAliases: knownNonChatAliases,
                 readiness: readiness,
+                loadProgress: readiness.isWorking ? progressSnapshot : nil,
                 supportsImageInput: imageAvailability.isAvailable,
                 imageInputUnavailableMessage: imageAvailability.unavailableMessage,
                 onUserModelSelection: selectChatModel,

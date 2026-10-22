@@ -132,12 +132,15 @@ identifiers (`ChatView.swift:1275`, `actionIdentifier`): **Copy**, **Edit**
    (`ModelPickerBar.swift:1440`) and is disambiguated from the composer's "Stop
    response" (see the comment at `:1442`).
 3. Readiness gating for image/audio/chat is centralised in `ModelReadiness`;
-   a readiness banner offers the switch action (`Readiness.Action`,
-   `Readiness.Band`).
+   a readiness banner offers the switch action (`Readiness.Action`). In chat,
+   download, load and a failed start render inside the composer card instead
+   (`Composer.LoadStatus`, `Composer.LoadProgress`); a failed start keeps its
+   recovery button there under the same `Readiness.Action` identifier.
 
 **Touches.** `UI/ModelPickerBar.swift`, `Server/ServerManager.swift`,
 `Server/ModelCatalog.swift`, `UI/ModelReadiness.swift`,
-`UI/ReadinessBanner.swift`, `UI/ReadinessModelStart.swift`.
+`UI/ReadinessBanner.swift`, `UI/ComposerLoadStatus.swift`,
+`UI/ReadinessModelStart.swift`.
 
 ---
 
@@ -146,10 +149,24 @@ identifiers (`ChatView.swift:1275`, `actionIdentifier`): **Copy**, **Edit**
 **Trigger.** Choose **Download** on an uncached alias (picker or Model
 Management), or a Quickstart download.
 
-**Expected.** `DownloadManager` spawns a `rapid-mlx pull <alias>` job; progress
-and cancel/dismiss surface in the download strip
-(`DownloadStrip.Cancel.<alias>`, `DownloadStrip.Dismiss.<alias>`). The models
-folder is honoured (see Flow 12). On success the alias becomes runnable.
+**Expected.** `DownloadManager` spawns a `rapid-mlx pull <alias>` job. When
+that task belongs to the selected model on the visible chat surface, progress
+and **Stop download** live in the composer (`Composer.DownloadAction`), and
+only that task's global strip row is hidden. Other tasks remain visible.
+Leaving chat or selecting another model returns the task to `DownloadStrip`;
+onboarding and non-chat pages retain the global controls.
+
+Stopping terminates the pull without deleting cached files; it is not a
+suspended process. The stopped task offers **Resume download** both in its
+composer and, when shown, in the global strip (`DownloadStrip.Resume.<alias>`).
+Resume retries the same alias/source/cache metadata and reuses whatever data
+the downloader can recover; it does not promise every byte is retained.
+Resume stays disabled until the old writer has been reaped. The existing strip
+stop identifier remains `DownloadStrip.Cancel.<alias>` for AX compatibility;
+dismiss remains `DownloadStrip.Dismiss.<alias>`. An unknown/new task still uses
+**Download**. In-memory model loading is a separate lifecycle, not a download
+pause operation. The models folder is honoured (see Flow 12). On success the
+alias becomes runnable.
 
 **Touches.** `Server/DownloadManager.swift`, `UI/DownloadStrip.swift`,
 `Server/ServerLocator.swift`, `Services/ModelCacheActions.swift`.
@@ -625,9 +642,9 @@ Prompt.Confirm,Prompt.Cancel}`, `Sidebar.DeleteFolder.{Confirm,Keep}`.
 `ModelPickerBar.Context.{Download,Delete}.<alias>`,
 `ModelPickerBar.CustomAlias.{Open,Field,Use,Cancel}`,
 `ModelPickerBar.Delete.{Confirm,Cancel}`. Readiness:
-`UI/ReadinessBanner.swift` `Readiness.Action`; `UI/Components/LifecycleBand.swift`
-`Readiness.Band`. Downloads: `UI/DownloadStrip.swift`
-`DownloadStrip.{Cancel,Dismiss}.<alias>`.
+`UI/ReadinessBanner.swift` `Readiness.Action`; `UI/Components/ComposerLoadStatusView.swift`
+`Composer.LoadStatus`, `Composer.LoadProgress`. Downloads: `UI/DownloadStrip.swift`
+`DownloadStrip.{Cancel,Resume,Dismiss}.<alias>`.
 
 **Quickstart / onboarding — `UI/QuickstartView.swift`:**
 `Quickstart.{GetStarted,Skip,BrowseAll,Ready.StartChatting,ResumeNotice,
