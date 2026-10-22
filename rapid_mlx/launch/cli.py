@@ -35,6 +35,7 @@ import shlex
 import signal
 import subprocess
 import sys
+from dataclasses import asdict
 from pathlib import Path
 from typing import TYPE_CHECKING
 from urllib.parse import urlsplit
@@ -51,29 +52,26 @@ PID_FILE = Path.home() / ".rapid-mlx" / "launch.pid"
 
 
 def _print_list(*, as_json: bool = False) -> int:
-    """Print the supported-clients + detection matrix.
+    """Print supported launch routes and their capabilities without mutation."""
+    from rapid_mlx.integrations import list_launch_targets
 
-    Output shape (one line per client):
-
-        cline           detected
-        claude-code     not detected
-        continue-dev    detected
-        cursor          not detected
-
-    Always returns 0 — listing is a read-only inspect command.
-    """
+    targets = list_launch_targets()
     if as_json:
-        from rapid_mlx.integrations import integration_targets_json
-
-        print(json.dumps(integration_targets_json(), ensure_ascii=False))
+        print(json.dumps([asdict(target) for target in targets], ensure_ascii=False))
         return 0
-    width = max(len(name) for name in ADAPTERS) + 2
-    print("Supported clients:")
-    for name, adapter in ADAPTERS.items():
-        status = "detected" if adapter.detect() else "not detected"
-        print(f"  {name.ljust(width)}{status}")
-    print("  claude-desktop  in-app gateway setup")
-    print("\nNote: cursor requires an explicit public HTTPS --server-url.")
+    width = max(len(target.id) for target in targets) + 2
+    print("Supported clients (default action):")
+    for target in targets:
+        name = target.id
+        status = ""
+        if name in ADAPTERS:
+            status = " — detected" if ADAPTERS[name].detect() else " — not detected"
+        print(f"  {name.ljust(width)}{target.capability}{status}")
+    print(
+        "\nconfig-only: writes configuration; start the server and client separately."
+    )
+    print("manual: follow the in-app gateway setup instructions.")
+    print("Note: cursor requires an explicit public HTTPS --server-url.")
     return 0
 
 
@@ -594,7 +592,11 @@ def launch_command(args: argparse.Namespace) -> None:
                 )
                 sys.exit(2)
         if args.client not in ADAPTERS:
-            supported = ", ".join(ADAPTERS.keys())
+            from rapid_mlx.integrations import list_launch_targets
+
+            supported = ", ".join(
+                f"{target.id} ({target.capability})" for target in list_launch_targets()
+            )
             print(
                 f"launch: unknown client {args.client!r}. Supported: {supported}.",
                 file=sys.stderr,
