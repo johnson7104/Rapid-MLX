@@ -817,6 +817,7 @@ def test_dflash_nonstream_timeout_keeps_gpu_slot_until_worker_finishes(
 
     from fastapi import HTTPException
 
+    from rapid_mlx.runtime.model_performance import get_model_performance_ledger
     from rapid_mlx.speculative.dflash import server as srv
 
     fake_mlx_vlm = types.ModuleType("mlx_vlm")
@@ -850,6 +851,9 @@ def test_dflash_nonstream_timeout_keeps_gpu_slot_until_worker_finishes(
         await asyncio.sleep(0.1)
         assert admission._reservations == 0
         assert not srv._dflash_lock.locked()
+        snapshot = get_model_performance_ledger("qwen3.5-27b-8bit").snapshot()
+        assert snapshot.total_requests == snapshot.requests_failed == 1
+        assert snapshot.prompt_tokens == snapshot.completion_tokens == 0
 
     asyncio.run(exercise_timeout())
 
@@ -3353,7 +3357,10 @@ def test_dflash_stream_backpressure_delivers_terminal_notice(monkeypatch) -> Non
     import types
 
     from rapid_mlx.api.models import ChatCompletionRequest, Message
+    from rapid_mlx.runtime.model_performance import get_model_performance_ledger
     from rapid_mlx.speculative.dflash import server as srv
+
+    model_name = "backpressure-cancellation-test"
 
     # Tiny queue + tiny backpressure window so the test triggers the cap fast.
     monkeypatch.setattr(srv, "_STREAM_QUEUE_MAXSIZE", 2)
@@ -3396,7 +3403,7 @@ def test_dflash_stream_backpressure_delivers_terminal_notice(monkeypatch) -> Non
         stream = srv._stream_completion(
             prompt="p",
             request=request,
-            served_model_name="qwen3.5-27b-8bit",
+            served_model_name=model_name,
             gen_kwargs={"max_tokens": 100},
             model=MagicMock(),
             processor=MagicMock(),
@@ -3439,6 +3446,10 @@ def test_dflash_stream_backpressure_delivers_terminal_notice(monkeypatch) -> Non
             await asyncio.sleep(0.01)
         assert not srv._dflash_lock.locked()
         assert admission._reservations == 0
+        snapshot = get_model_performance_ledger(model_name).snapshot()
+        assert snapshot.requests_cancelled == 1
+        assert snapshot.requests_failed == 0
+        assert snapshot.requests_succeeded == 0
 
     srv._dflash_lock = asyncio.Lock()
     try:
@@ -4014,3 +4025,286 @@ def test_dflash_e2e_chat_completion_smoke() -> None:
     assert body["choices"][0]["message"]["role"] == "assistant"
     assert body["choices"][0]["message"]["content"]
     assert body["usage"]["completion_tokens"] > 0
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("tokens", [0, 1, 3])
+@pytest.mark.parametrize("fail", [False, True])
+def test_serial_lane_metrics_and_share_scrape(monkeypatch, stream, tokens, fail):
+    """TensorFold's shared app exposes real counters without loading a model."""
+    import io
+    import time
+
+    from fastapi.testclient import TestClient
+    from prometheus_client.parser import text_string_to_metric_families
+
+    from rapid_mlx.share import quicksilver as qs
+    from rapid_mlx.speculative.dflash.server import _build_app
+
+    def generate(*args, **kwargs):
+        if fail:
+            raise RuntimeError("fake generation failed")
+        return SimpleNamespace(text="hello", prompt_tokens=7, generation_tokens=tokens)
+
+    def stream_generate(*args, **kwargs):
+        for index in range(1, tokens + 1):
+            time.sleep(0.001)
+            yield SimpleNamespace(
+                text="hi", token=index, prompt_tokens=7, generation_tokens=index
+            )
+        if fail:
+            raise RuntimeError("fake generation failed")
+
+    app = _build_app(
+        model=SimpleNamespace(config={}),
+        processor=SimpleNamespace(eos_token_id=99),
+        runtime=SimpleNamespace(drafter=None),
+        served_model_name="qwen3.8-27b-tensorfold",
+        default_max_tokens=16,
+        cors_origins=[],
+        api_key="test-secret",
+        backend_name="TensorFold",
+        render_prompt_fn=lambda *args, **kwargs: "prompt",
+        generation_kwargs_fn=lambda **kwargs: kwargs,
+        generate_fn=generate,
+        stream_generate_fn=stream_generate,
+        strict_openai_streaming=True,
+    )
+    client = TestClient(app, base_url="http://127.0.0.1")
+    response = client.get("/metrics")
+    assert response.status_code == 200  # Same unauthenticated probe as main serve.
+    assert qs._PoolStatus._parse(response.text) == (0, 0, 0, 0)
+    body = {
+        "model": "qwen3.8-27b-tensorfold",
+        "messages": [{"role": "user", "content": "hi"}],
+        "stream": stream,
+    }
+    assert client.post("/v1/chat/completions", json=body).status_code == 401
+    result = client.post(
+        "/v1/chat/completions",
+        json=body,
+        headers={"Authorization": "Bearer test-secret"},
+    )
+    assert result.status_code == (500 if fail and not stream else 200), result.text
+    response = client.get("/metrics")
+    assert response.headers["content-type"].startswith("text/plain; version=0.0.4")
+    assert "rapid_mlx_model_loaded" not in response.text
+    families = list(text_string_to_metric_families(response.text))
+    outcomes = {
+        sample.labels["outcome"]: sample.value
+        for family in families
+        for sample in family.samples
+        if sample.name == "rapid_mlx_model_requests_total"
+    }
+    assert outcomes == {"succeeded": int(not fail), "failed": int(fail), "cancelled": 0}
+    values = qs._PoolStatus._parse(response.text)
+    assert values is not None
+    assert values[:2] == (int(not fail), tokens if stream or not fail else 0)
+    assert values[3] == int(stream and tokens >= 2)
+    assert (values[2] > 0) == (stream and tokens >= 2)
+    assert qs._PoolStatus._parse(client.get("/metrics").text) == values
+
+    # Exercise the actual scraper's URL, auth, bounded read and parser using
+    # an in-process HTTP transport so this test needs no listening socket.
+    def open_metrics(request, timeout):
+        assert request.full_url == "http://127.0.0.1:12345/metrics"
+        assert request.get_header("Authorization") == "Bearer test-secret"
+        scraped = client.get("/metrics", headers=dict(request.header_items()))
+        payload = io.BytesIO(scraped.content)
+        payload.status = scraped.status_code
+        payload.headers = scraped.headers
+        return payload
+
+    monkeypatch.setattr(qs, "_open", open_metrics)
+    status = qs._PoolStatus(12345, lambda: True, api_key="test-secret")
+    assert status.baseline == values
+    assert status._scrape() == values
+
+
+@pytest.mark.parametrize("city", ['"Paris"', "123"])
+def test_serial_lane_nonstream_tool_validation_metrics(monkeypatch, city):
+    """Post-generation tool errors retain the engine's succeeded outcome."""
+    from fastapi.testclient import TestClient
+
+    from rapid_mlx.runtime.model_performance import get_model_performance_ledger
+    from rapid_mlx.speculative.dflash import server as srv
+
+    model_name = "tool-validation-test"
+    ledger = get_model_performance_ledger(model_name)
+    success = MagicMock(wraps=ledger.record_success)
+    failure = MagicMock(wraps=ledger.record_failure)
+    cancelled = MagicMock(wraps=ledger.record_cancelled)
+    monkeypatch.setattr(ledger, "record_success", success)
+    monkeypatch.setattr(ledger, "record_failure", failure)
+    monkeypatch.setattr(ledger, "record_cancelled", cancelled)
+    monkeypatch.setattr(srv.uuid, "uuid4", lambda: SimpleNamespace(hex="a" * 32))
+    app = srv._build_app(
+        model=SimpleNamespace(config={}),
+        processor=SimpleNamespace(eos_token_id=99),
+        runtime=SimpleNamespace(drafter=None),
+        served_model_name=model_name,
+        default_max_tokens=64,
+        cors_origins=[],
+        tool_call_parser="hermes",
+        render_prompt_fn=lambda *args, **kwargs: "prompt",
+        generation_kwargs_fn=lambda **kwargs: kwargs,
+        generate_fn=lambda *args, **kwargs: SimpleNamespace(
+            text=(
+                '<tool_call>{"name":"get_weather","arguments":{"city":'
+                + city
+                + "}}</tool_call>"
+            ),
+            prompt_tokens=7,
+            generation_tokens=3,
+        ),
+    )
+    response = TestClient(app, base_url="http://127.0.0.1").post(
+        "/v1/chat/completions",
+        json={
+            "model": model_name,
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "get_weather",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"city": {"type": "string"}},
+                        },
+                    },
+                }
+            ],
+        },
+    )
+    if city == "123":
+        assert response.status_code == 400, response.text
+        assert "violates declared schema" in response.json()["error"]["message"]
+    else:
+        assert response.status_code == 200, response.text
+        assert response.json()["id"] == "chatcmpl-" + "a" * 24
+        assert response.json()["choices"][0]["finish_reason"] == "tool_calls"
+    success.assert_called_once_with(
+        "chatcmpl-" + "a" * 24,
+        prompt_tokens=7,
+        completion_tokens=3,
+        ttft_seconds=None,
+        decode_tokens_per_second=None,
+    )
+    failure.assert_not_called()
+    cancelled.assert_not_called()
+    snapshot = ledger.snapshot()
+    assert snapshot.total_requests == snapshot.requests_succeeded == 1
+    assert snapshot.prompt_tokens == 7
+    assert snapshot.completion_tokens == 3
+    assert snapshot.ttft_seconds_count == snapshot.decode_observations == 0
+
+
+async def test_serial_lane_nonstream_reasoning_only_metrics(monkeypatch):
+    """A reasoning-only generation still records one engine success."""
+    import asyncio
+
+    from rapid_mlx.api.models import ChatCompletionRequest
+    from rapid_mlx.config import get_config
+    from rapid_mlx.runtime.model_performance import get_model_performance_ledger
+    from rapid_mlx.speculative.dflash import server as srv
+
+    monkeypatch.setattr(srv, "_dflash_lock", asyncio.Lock())
+    monkeypatch.setattr(get_config(), "reasoning_parser_name", "qwen3")
+    response = await srv._non_stream_completion(
+        prompt="prompt",
+        request=ChatCompletionRequest(
+            model="reasoning-only-test", messages=[{"role": "user", "content": "hi"}]
+        ),
+        served_model_name="reasoning-only-test",
+        gen_kwargs={},
+        model=None,
+        processor=None,
+        timeout=0,
+        enable_thinking=True,
+        generate_fn=lambda *args, **kwargs: SimpleNamespace(
+            text="<think>Still thinking", prompt_tokens=7, generation_tokens=3
+        ),
+    )
+    assert response.choices[0].message.content is None
+    assert response.choices[0].message.reasoning_content == "Still thinking"
+    snapshot = get_model_performance_ledger("reasoning-only-test").snapshot()
+    assert snapshot.total_requests == snapshot.requests_succeeded == 1
+    assert snapshot.prompt_tokens == 7
+    assert snapshot.completion_tokens == 3
+
+
+async def test_serial_lane_nonstream_cancellation_metrics(monkeypatch):
+    import asyncio
+    import threading
+
+    from rapid_mlx.api.models import ChatCompletionRequest
+    from rapid_mlx.runtime.model_performance import get_model_performance_ledger
+    from rapid_mlx.speculative.dflash import server as srv
+
+    entered = threading.Event()
+    release = threading.Event()
+    monkeypatch.setattr(srv, "_dflash_lock", asyncio.Lock())
+
+    def generate(*args, **kwargs):
+        entered.set()
+        assert release.wait(5)
+        return SimpleNamespace(text="done", prompt_tokens=7, generation_tokens=3)
+
+    task = asyncio.create_task(
+        srv._non_stream_completion(
+            prompt="prompt",
+            request=ChatCompletionRequest(
+                model="cancelled-test", messages=[{"role": "user", "content": "hi"}]
+            ),
+            served_model_name="cancelled-test",
+            gen_kwargs={},
+            model=None,
+            processor=None,
+            timeout=0,
+            generate_fn=generate,
+        )
+    )
+    try:
+        assert await asyncio.to_thread(entered.wait, 2)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        snapshot = get_model_performance_ledger("cancelled-test").snapshot()
+        assert snapshot.total_requests == snapshot.requests_cancelled == 1
+        assert snapshot.prompt_tokens == snapshot.completion_tokens == 0
+    finally:
+        release.set()
+        # Drain deferred cleanup while this event loop is still alive.
+        await asyncio.wait_for(srv._dflash_lock.acquire(), 2)
+        srv._dflash_lock.release()
+
+
+async def test_serial_lane_escaped_client_abort_is_cancelled(monkeypatch):
+    """An abort escaping the producer is suppressed and recorded exactly once."""
+    from rapid_mlx.api.models import ChatCompletionRequest
+    from rapid_mlx.runtime.model_performance import get_model_performance_ledger
+    from rapid_mlx.speculative.dflash import server as srv
+
+    async def abort_on_enter(self):
+        raise srv._DFlashClientGoneError
+
+    monkeypatch.setattr(srv._DFlashStreamLease, "__aenter__", abort_on_enter)
+    model_name = "escaped-client-abort-test"
+    stream = srv._stream_completion(
+        prompt="prompt",
+        request=ChatCompletionRequest(
+            model=model_name, messages=[{"role": "user", "content": "hi"}], stream=True
+        ),
+        served_model_name=model_name,
+        gen_kwargs={},
+        model=None,
+        processor=None,
+        stream_generate_fn=lambda **kwargs: iter(()),
+    )
+    frames = [frame async for frame in stream]
+    assert len(frames) == 1  # The role marker precedes producer startup.
+    snapshot = get_model_performance_ledger(model_name).snapshot()
+    assert snapshot.requests_cancelled == 1
+    assert snapshot.requests_failed == 0
+    assert snapshot.requests_succeeded == 0
