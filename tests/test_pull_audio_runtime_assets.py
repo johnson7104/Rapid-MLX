@@ -14,6 +14,7 @@ import pytest
 
 from rapid_mlx import cli
 from rapid_mlx.audio import registry, runtime_requirements
+from tests.pull_integrity_helpers import hub_integrity_metadata, snapshot_tree  # noqa: F401
 
 
 @pytest.fixture(autouse=True)
@@ -205,7 +206,7 @@ def test_main_pull_requirement_failure_is_actionable_without_traceback(
 
 
 def test_runtime_asset_uses_normal_filtered_download_pipeline(
-    monkeypatch, tmp_path, capsys
+    hub_online_env, monkeypatch, tmp_path, capsys
 ) -> None:
     seen: dict[str, object] = {}
 
@@ -215,7 +216,7 @@ def test_runtime_asset_uses_normal_filtered_download_pipeline(
 
     def fake_snapshot(repo_id, *, allow_patterns=None):
         seen["snapshot"] = (repo_id, allow_patterns)
-        return str(tmp_path)
+        return str(snapshot_tree(tmp_path, filename="voices/voice.safetensors"))
 
     monkeypatch.setattr(cli, "_try_mirror_prefetch", fake_mirror)
     monkeypatch.setattr("huggingface_hub.snapshot_download", fake_snapshot)

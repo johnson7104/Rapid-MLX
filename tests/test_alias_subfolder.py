@@ -30,6 +30,7 @@ from rapid_mlx.model_aliases import (
     subfolder_allow_patterns,
 )
 from rapid_mlx.utils.tokenizer import _resolve_subfolder_checkpoint
+from tests.pull_integrity_helpers import hub_integrity_metadata, snapshot_tree  # noqa: F401
 
 ALIAS = "lfm2.5-2.6b-4bit"
 REPO = "LiquidAI/LFM2.5-2.6B-MLX"
@@ -715,7 +716,9 @@ def test_unclosed_think_does_not_leak_into_content():
     assert "</think>" not in (content or "")
 
 
-def test_pull_narrows_to_the_checkpoint_and_says_so(monkeypatch, capsys, tmp_path):
+def test_pull_narrows_to_the_checkpoint_and_says_so(
+    hub_online_env, monkeypatch, capsys, tmp_path
+):
     """``pull`` fetches only the served folder — for the bare repo id too.
 
     Every other consumer already reaches inside on the repo id: the gate
@@ -728,8 +731,7 @@ def test_pull_narrows_to_the_checkpoint_and_says_so(monkeypatch, capsys, tmp_pat
 
     import rapid_mlx.cli as cli
 
-    snapshot = tmp_path / "snap"
-    (snapshot / "4bit").mkdir(parents=True)
+    snapshot = snapshot_tree(tmp_path, filename="4bit/model.safetensors")
     seen: dict = {}
 
     def fake_dl(rid, **kw):
@@ -749,7 +751,7 @@ def test_pull_narrows_to_the_checkpoint_and_says_so(monkeypatch, capsys, tmp_pat
     )
 
 
-def test_pull_of_a_flat_repo_is_unfiltered(monkeypatch, tmp_path):
+def test_pull_of_a_flat_repo_is_unfiltered(hub_online_env, monkeypatch, tmp_path):
     """The generic contract is untouched for every ordinary repo."""
     import argparse
 
@@ -759,7 +761,7 @@ def test_pull_of_a_flat_repo_is_unfiltered(monkeypatch, tmp_path):
 
     def fake_dl(rid, **kw):
         seen["allow"] = kw.get("allow_patterns", "ABSENT")
-        return str(tmp_path)
+        return str(snapshot_tree(tmp_path))
 
     monkeypatch.setattr("huggingface_hub.snapshot_download", fake_dl)
     monkeypatch.setattr(cli, "_try_mirror_prefetch", lambda *a, **kw: False)
