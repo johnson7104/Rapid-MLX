@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 import pytest
@@ -364,10 +365,27 @@ def test_observe_provider_fallback():
     assert observed == [([[[1], [2]]], 3)]
 
 
-def test_benchmark_main_tiny_and_checkpoint_provider(monkeypatch, capsys):
-    assert bench.main(["--tokens", "2", "--repeats", "1"]) == 0
+@pytest.mark.parametrize("component_timers", [False, True])
+def test_benchmark_main_tiny_and_checkpoint_provider(
+    monkeypatch, capsys, component_timers
+):
+    argv = ["--tokens", "2", "--repeats", "1"]
+    if component_timers:
+        argv.append("--component-timers")
+    assert bench.main(argv) == 0
     result = json.loads(capsys.readouterr().out)
+    assert result["component_timers"] is component_timers
+    for row in result["classes"]:
+        for run in row["runs"]:
+            means = run["draft_on"]["mean_round_ms"]
+            for name in ("attention", "moe", "head", "markov"):
+                key = f"draft_{name}_ms"
+                if component_timers:
+                    assert means[key] > 0
+                else:
+                    assert key not in means
     assert result["_schema_version"] == 1
+    assert result["output_format_version"] == 2
     assert len(result["_methodology_hash"]) == 64
     model, draft = bench.tiny_setup()
     runtime = serving.DSparkRuntime(draft, "synthetic", "synthetic", "synthetic")
@@ -398,8 +416,86 @@ def test_benchmark_main_tiny_and_checkpoint_provider(monkeypatch, capsys):
     result = json.loads(capsys.readouterr().out)
     assert result["mode"] == "checkpoint" and result["label"] == "old"
     assert calls[0][0] == ("checkpoint", "sidecar")
+    assert "mixed_target_precision" not in calls[0][1]
+    assert (
+        bench.main(
+            [
+                "--model",
+                "checkpoint",
+                "--mixed-target-precision",
+                "--tokens",
+                "1",
+                "--repeats",
+                "1",
+                "--prompt-class",
+                "qa",
+            ]
+        )
+        == 0
+    )
+    capsys.readouterr()
+    assert calls[1][1]["mixed_target_precision"] is True
     with pytest.raises(SystemExit):
         bench.main(["--tokens", "0"])
+    with pytest.raises(SystemExit):
+        bench.main(["--prompt", "hi", "--prompt-class", "qa"])
+
+
+def test_benchmark_rejects_empty_raw_prompt_before_loading(monkeypatch, capsys):
+    def unexpected_load(*args, **kwargs):
+        pytest.fail("empty raw prompt must be rejected before loading a model")
+
+    monkeypatch.setattr(serving, "load_product_runtime", unexpected_load)
+    with pytest.raises(SystemExit) as error:
+        bench.main(["--model", "checkpoint", "--raw", "--prompt", ""])
+    assert error.value.code == 2
+    assert "raw prompt must not be empty" in capsys.readouterr().err
+
+
+class RecordingTokenizer(bench.TinyTokenizer):
+    def __init__(self):
+        self.encoded = []
+
+    def encode(self, text, **kwargs):
+        self.encoded.append(text)
+        return super().encode(text, **kwargs)
+
+
+@pytest.mark.parametrize("raw", [False, True])
+def test_benchmark_renders_chat_prompts_per_class_unless_raw(monkeypatch, capsys, raw):
+    model, draft = bench.tiny_setup()
+    runtime = serving.DSparkRuntime(draft, "synthetic", "synthetic", "synthetic")
+    tokenizer = RecordingTokenizer()
+    monkeypatch.setattr(
+        serving, "load_product_runtime", lambda *a, **k: (model, tokenizer, runtime)
+    )
+    argv = ["--model", "checkpoint", "--tokens", "2", "--repeats", "1"]
+    assert bench.main(argv + (["--raw"] if raw else [])) == 0
+    result = json.loads(capsys.readouterr().out)
+    assert result["prompt_format"] == ("raw" if raw else "chat")
+    assert [c["prompt_class"] for c in result["classes"]] == list(bench.PROMPT_CLASSES)
+    for row in result["classes"]:
+        on = row["runs"][0]["draft_on"]
+        # every generated token is emitted by exactly one round
+        assert on["tokens_per_round"] * on["rounds"] == 2
+        assert row["prompt_tokens"] == 4
+    for text in bench.PROMPT_CLASSES.values():
+        measured = [t for t in tokenizer.encoded if text in t]
+        rendered = "<bos><｜User｜>" + text + "<｜Assistant｜></think>"
+        assert (measured[-1] == text) is raw
+        assert (measured[-1] == rendered) is not raw
+
+    assert bench.main(argv + ["--prompt", "Say hi."]) == 0
+    result = json.loads(capsys.readouterr().out)
+    assert [c["prompt_class"] for c in result["classes"]] == ["custom"]
+
+
+@pytest.mark.parametrize(
+    ("left", "right", "expected"),
+    [([1, 2, 3], [1, 2, 3], None), ([1, 2, 3], [1, 4, 3], 1), ([1, 2], [1, 2, 3], 2)],
+)
+def test_first_difference(left, right, expected):
+    assert bench.first_difference(left, right) == expected
 
 
 @pytest.mark.usefixtures("cpu_device")
@@ -427,7 +523,8 @@ def test_benchmark_script_entrypoint(monkeypatch, capsys):
     with pytest.raises(SystemExit) as result:
         runpy.run_path(bench.__file__, run_name="__main__")
     assert result.value.code == 0
-    assert json.loads(capsys.readouterr().out)["runs"][0]["greedy_equal"]
+    run = json.loads(capsys.readouterr().out)["classes"][0]["runs"][0]
+    assert run["greedy_equal"] and run["first_difference"] is None
 
 
 @pytest.mark.parametrize("dtype", [mx.float32, mx.bfloat16])
@@ -617,6 +714,7 @@ def test_all_depths_preserve_target_tokens(depth, monkeypatch):
         serving, model, bench.TinyTokenizer(), runtime, prefix, 45
     )
     assert output == plain
+    assert stats["tokens_per_round"] * stats["rounds"] == len(output)
     assert stats["mean_round_ms"]["draft_ms"] >= 0
     if depth == "0":
         assert draft.position == -1
@@ -704,3 +802,39 @@ def test_benchmark_waits_for_draft_completion(monkeypatch):
     )
     index = events.index("draft_return")
     assert events[index + 1 : index + 4] == ["eval", "sync", "timer"]
+
+
+def test_tokens_per_round_counts_only_emitted_tokens():
+    # A token limit inside a round emits fewer than accepted drafts + 1.
+    model, draft = bench.tiny_setup()
+    runtime = serving.DSparkRuntime(draft, "synthetic", "synthetic", "synthetic")
+    prompt = bench.TinyTokenizer().encode("")
+    for count in (1, 3, 7):
+        output, stats = bench.speculative_decode(
+            serving, model, bench.TinyTokenizer(), runtime, prompt, count
+        )
+        assert len(output) == count
+        assert stats["tokens_per_round"] * stats["rounds"] == count
+
+
+@pytest.mark.usefixtures("cpu_device")
+@pytest.mark.parametrize("fail", [False, True])
+def test_component_timers_restore_instance_and_inherited_methods(fail):
+    _, draft = bench.tiny_setup()
+    # Exercise restoration of an instance override as well as class methods.
+    draft.head = draft.head
+    original_head = draft.head
+    original_attention = draft.attention
+    expected = (
+        pytest.raises(RuntimeError, match="timer cleanup") if fail else nullcontext()
+    )
+    with expected, bench.draft_component_timing(draft, enabled=True):
+        assert draft.head is not original_head
+        assert draft.attention != original_attention
+        if fail:
+            raise RuntimeError("timer cleanup")
+    assert draft.head is original_head
+    assert draft.attention == original_attention
+    assert "attention" not in vars(draft)
+    assert "markov" not in vars(draft)
+    assert "moe" not in vars(draft.adapter)
