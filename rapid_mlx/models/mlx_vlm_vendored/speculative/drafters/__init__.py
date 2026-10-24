@@ -401,6 +401,15 @@ def load_drafter(
 
     path = get_model_path(path_or_repo)
     config = _read_drafter_config(path)
+    from rapid_mlx.utils.model_file_guard import (
+        remote_code_enabled,
+        validate_local_model_file,
+        validate_model_code,
+    )
+
+    trust = remote_code_enabled(kwargs.pop("trust_remote_code", None))
+    validate_model_code(config, trust_remote_code=trust)
+    validate_local_model_file(path)
     peeked = _normalized_drafter_model_type(config)
     install_served_architecture_bindings(peeked)
     resolved = resolve_drafter_kind(path, kind)
@@ -461,7 +470,7 @@ def load_drafter(
         family_model.load_weights(list(weights.items()), strict=True)
         mx.eval(family_model.parameters())
         return family_model, resolved
-    return load_model(path, **kwargs), resolved
+    return load_model(path, trust_remote_code=trust, **kwargs), resolved
 
 
 __all__ = [

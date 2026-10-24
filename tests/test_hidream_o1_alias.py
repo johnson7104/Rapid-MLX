@@ -22,7 +22,10 @@ from rapid_mlx.image.engine import (
 from rapid_mlx.model_aliases import resolve_profile
 from rapid_mlx.model_sizes import size_bytes
 from rapid_mlx.runtime.resident_models import estimate_model_bytes
-from tests.pull_integrity_helpers import hub_integrity_metadata, snapshot_tree  # noqa: F401
+from tests.pull_integrity_helpers import (  # noqa: F401
+    hub_integrity_metadata,
+    snapshot_tree,
+)
 
 REPO = "mlx-community/HiDream-O1-Image-Dev-mlx-bf16"
 REVISION = "33c7a00bce8e3410304f83ec408a15a1eb6782df"
@@ -254,6 +257,9 @@ def test_hidream_constructor_loads_only_validated_custom_heads(
     mlx_vlm = types.ModuleType("mlx_vlm")
     mlx_vlm.load = lambda model_path: (backbone, f"processor:{model_path}")
     monkeypatch.setitem(sys.modules, "mlx_vlm", mlx_vlm)
+    monkeypatch.setattr(
+        "rapid_mlx.utils.model_file_guard.load_vlm_with_policy", mlx_vlm.load
+    )
     monkeypatch.setattr(runtime, "TimestepEmbedder", TinyHead)
     monkeypatch.setattr(runtime, "BottleneckPatchEmbed", TinyHead)
     monkeypatch.setattr(runtime, "FinalLayer", TinyHead)
