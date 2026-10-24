@@ -32,7 +32,14 @@ def _endpoints(host="localhost", port=8000, model="qwen3.6-35b-4bit"):
 
 
 def _run_connect(
-    *, target=None, json_=False, host=None, port=None, model=None, base_url=None
+    *,
+    target=None,
+    json_=False,
+    host=None,
+    port=None,
+    model=None,
+    base_url=None,
+    allow_insecure_api_key=False,
 ):
     """Invoke ``connect_command`` the way argparse drives it, capturing stdout."""
     buf = io.StringIO()
@@ -45,6 +52,7 @@ def _run_connect(
                 port=port,
                 model=model,
                 base_url=base_url,
+                allow_insecure_api_key=allow_insecure_api_key,
             )
         )
     return buf.getvalue()
@@ -152,12 +160,18 @@ def test_probe_server_alive_keys_on_healthz_status_code(monkeypatch):
     import urllib.error
     import urllib.request
 
+    responses = []
+
     def _ok(url, timeout=None):
-        return object()  # urlopen returns without raising on 2xx
+        response = io.BytesIO(b"healthy")
+        responses.append(response)
+        return response
 
     def _raise(code):
         def _open(url, timeout=None):
-            raise urllib.error.HTTPError(url, code, "err", {}, None)
+            response = io.BytesIO(b"error")
+            responses.append(response)
+            raise urllib.error.HTTPError(url, code, "err", {}, response)
 
         return _open
 
@@ -167,17 +181,20 @@ def test_probe_server_alive_keys_on_healthz_status_code(monkeypatch):
     # 2xx (any serving mode) → alive.
     monkeypatch.setattr(urllib.request, "urlopen", _ok)
     assert connect.probe_server_alive("localhost", 8000) is True
+    assert responses[-1].closed
 
     # Auth-gated DDTree /healthz answers 401/403 → still a server there.
     for code in (401, 403):
         monkeypatch.setattr(urllib.request, "urlopen", _raise(code))
         assert connect.probe_server_alive("localhost", 8000) is True, code
+        assert responses[-1].closed
 
     # 404 (unrelated server), 503 (up but draining, refusing new work), and
     # 500 (broken) are all "don't hand a client this endpoint".
     for code in (404, 500, 503):
         monkeypatch.setattr(urllib.request, "urlopen", _raise(code))
         assert connect.probe_server_alive("localhost", 8000) is False, code
+        assert responses[-1].closed
 
     # Nothing listening: connection refused.
     monkeypatch.setattr(urllib.request, "urlopen", _conn)
@@ -405,7 +422,7 @@ def test_resolve_endpoints_preserves_explicit_model(monkeypatch):
 
     probe_called = []
 
-    def fake_probe(host, port):
+    def fake_probe(host, port, **kwargs):
         probe_called.append((host, port))
         return "server-says-other-model"
 
@@ -428,7 +445,7 @@ def test_resolve_endpoints_probes_when_no_model(monkeypatch):
 
     probe_called = []
 
-    def fake_probe(host, port):
+    def fake_probe(host, port, **kwargs):
         probe_called.append((host, port))
         return "probed-model"
 
@@ -581,13 +598,11 @@ def test_parse_base_url_does_not_decode_non_zone_host_escapes():
 def test_parse_base_url_default_port_and_errors():
     # No port → the rapid-mlx default.
     assert connect._parse_base_url("http://server.local/v1") == ("server.local", 8000)
-    # Non-http scheme (incl. https, which the http-only connect SSOT would
-    # silently downgrade), malformed URL, no host, an out-of-range/zero
+    # Unsupported scheme, malformed URL, no host, an out-of-range/zero
     # explicit port, and an unexpected path-prefix (a proxied endpoint the
     # SSOT does not model) are all rejected rather than retargeting the snippet.
     for bad in (
         "ftp://localhost:8123",
-        "https://localhost:8123/v1",
         "not-a-url",
         "http://:8123",
         "http://localhost:0/v1",
@@ -611,7 +626,7 @@ def test_connect_base_url_partial_override_keeps_other_coordinate(monkeypatch):
     only `--host` must keep the base URL's port (not fall back to 8000)."""
     probed = []
 
-    def fake_probe(host, port):
+    def fake_probe(host, port, **kwargs):
         probed.append((host, port))
         return "m"
 
@@ -631,7 +646,7 @@ def test_connect_openai_python_uses_base_url_for_snippet(monkeypatch):
     default to localhost:8000."""
     probed = []
 
-    def fake_probe(host, port):
+    def fake_probe(host, port, **kwargs):
         probed.append((host, port))
         return "lfm2.5-1b-4bit"
 
@@ -648,7 +663,7 @@ def test_connect_base_url_yields_to_explicit_host_port(monkeypatch):
     """Explicit --host/--port flags win over --base-url (flags > base-url)."""
     probed = []
 
-    def fake_probe(host, port):
+    def fake_probe(host, port, **kwargs):
         probed.append((host, port))
         return "m"
 
@@ -702,3 +717,210 @@ def test_point_command_base_url_is_shell_quoted():
     # The copy-paste command's --base-url is shell-quoted. (The human-facing
     # ``→  <url>`` echo line above it is informational, not a command.)
     assert f"--base-url {expected}" in out
+
+
+@pytest.fixture
+def auth_connect_server(monkeypatch):
+    """Exercise real HTTP discovery without loading a model or using the GPU."""
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    from threading import Thread
+
+    from rapid_mlx.config import get_config
+
+    cfg = get_config()
+    for name in ("bind_host", "bind_port", "model_alias", "model_name"):
+        monkeypatch.setattr(cfg, name, None)
+    monkeypatch.delenv("RAPID_MLX_API_KEY", raising=False)
+    state = {"status": 401, "requests": [], "models": [{"id": "loaded-model"}]}
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            state["requests"].append((self.path, self.headers.get("Authorization")))
+            if self.path == "/v1/models" and state.get("redirect"):
+                self.send_response(302)
+                self.send_header("Location", "/redirected-models")
+            elif (
+                self.path in ("/healthz", "/redirected-models")
+                or self.headers.get("Authorization") == "Bearer test-key"
+            ):
+                self.send_response(200)
+            else:
+                self.send_response(state["status"])
+            self.end_headers()
+            self.wfile.write(json.dumps({"data": state["models"]}).encode())
+
+        def log_message(self, *args):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield server.server_port, state
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
+
+
+def test_connect_authenticated_discovery(auth_connect_server, monkeypatch):
+    port, state = auth_connect_server
+    monkeypatch.setenv("RAPID_MLX_API_KEY", "test-key")
+    payload = json.loads(_run_connect(host="127.0.0.1", port=port, json_=True))
+    assert payload["model"] == "loaded-model"
+    assert ("/v1/models", "Bearer test-key") in state["requests"]
+    assert "test-key" not in json.dumps(payload)
+    banner = _run_connect(host="127.0.0.1", port=port)
+    assert "loaded-model" in banner
+    assert "RAPID_MLX_API_KEY" in banner
+    assert "test-key" not in banner
+
+
+@pytest.mark.parametrize("status", [401, 403])
+@pytest.mark.parametrize("key", [None, "wrong-key"])
+def test_connect_rejected_auth_is_explicit(
+    auth_connect_server, monkeypatch, status, key
+):
+    port, state = auth_connect_server
+    state["status"] = status
+    if key:
+        monkeypatch.setenv("RAPID_MLX_API_KEY", key)
+    payload = json.loads(_run_connect(host="127.0.0.1", port=port, json_=True))
+    assert payload["model"] is None
+    assert payload["auth_required"] is True
+    banner = _run_connect(host="127.0.0.1", port=port)
+    assert "(authentication required)" in banner
+    assert "(not yet loaded)" not in banner
+    assert "export RAPID_MLX_API_KEY=" in banner
+    assert "wrong-key" not in banner
+
+
+@pytest.mark.parametrize("key", [None, "test-key"])
+def test_connect_python_snippet_reads_environment(
+    auth_connect_server, monkeypatch, key
+):
+    port, _ = auth_connect_server
+    if key:
+        monkeypatch.setenv("RAPID_MLX_API_KEY", key)
+    out = _run_connect(target="python", host="127.0.0.1", port=port, model="explicit")
+    assert "import os" in out
+    assert 'os.environ.get("RAPID_MLX_API_KEY") or "sk-noop"' in out
+    assert "RAPID_MLX_API_KEY" in out
+    assert "test-key" not in out
+
+
+@pytest.mark.parametrize(
+    "status,models,expected",
+    [
+        (200, [{"id": "public-model"}], "public-model"),
+        (200, [], None),
+        (500, [{"id": "not-available"}], None),
+    ],
+)
+def test_connect_non_auth_responses(auth_connect_server, status, models, expected):
+    port, state = auth_connect_server
+    state.update(status=status, models=models)
+    payload = json.loads(_run_connect(host="127.0.0.1", port=port, json_=True))
+    assert payload["model"] == expected
+    assert "auth_required" not in payload
+    assert state["requests"] == [("/v1/models", None)]
+
+
+def test_connect_does_not_forward_key_on_redirect(auth_connect_server, monkeypatch):
+    port, state = auth_connect_server
+    state["redirect"] = True
+    monkeypatch.setenv("RAPID_MLX_API_KEY", "test-key")
+    assert connect._probe_running_model("127.0.0.1", port) == "loaded-model"
+    assert state["requests"] == [
+        ("/v1/models", "Bearer test-key"),
+        ("/redirected-models", None),
+    ]
+
+
+@pytest.mark.parametrize("status", [401, 403, 500])
+def test_connect_probe_closes_rejected_response(monkeypatch, status):
+    import urllib.error
+    import urllib.request
+
+    body = io.BytesIO(b"rejected")
+    error = urllib.error.HTTPError(
+        "http://localhost/v1/models", status, "error", {}, body
+    )
+
+    def reject(*args, **kwargs):
+        raise error
+
+    monkeypatch.setattr(urllib.request, "urlopen", reject)
+    if status in (401, 403):
+        with pytest.raises(PermissionError):
+            connect._probe_running_model("localhost", 12345)
+    else:
+        assert connect._probe_running_model("localhost", 12345) is None
+    assert body.closed
+
+
+@pytest.mark.parametrize(
+    "url,opt_in,expected_auth",
+    [
+        ("http://localhost:12345/v1", False, True),
+        ("http://127.0.0.2:12345/v1", False, True),
+        ("http://[::1]:12345/v1", False, True),
+        ("https://remote.example/v1", False, True),
+        ("https://remote.example:9443/v1", False, True),
+        ("http://remote.example:12345/v1", False, False),
+        ("http://192.0.2.1:12345/v1", False, False),
+        ("http://localhost.example:12345/v1", False, False),
+        ("http://remote.example:12345/v1", True, True),
+    ],
+)
+@pytest.mark.parametrize("key", [None, "test-key"])
+def test_connect_transport_policy(
+    auth_connect_server, monkeypatch, capsys, url, opt_in, expected_auth, key
+):
+    import urllib.request
+
+    if key:
+        monkeypatch.setenv("RAPID_MLX_API_KEY", key)
+    requests = []
+
+    def respond(request, **kwargs):
+        requests.append(request)
+        return io.BytesIO(b'{"data": [{"id": "loaded-model"}]}')
+
+    monkeypatch.setattr(urllib.request, "urlopen", respond)
+    output = _run_connect(base_url=url, json_=True, allow_insecure_api_key=opt_in)
+    payload = json.loads(output)
+    expected_base = url.removesuffix("/v1")
+    if expected_base == "https://remote.example":
+        expected_base += ":443"
+    assert payload["ready"] == expected_base
+    assert payload["model"] == "loaded-model"
+    assert requests[0].full_url == expected_base + "/v1/models"
+    assert requests[0].get_header("Authorization") == (
+        "Bearer test-key" if expected_auth and key else None
+    )
+    stderr = capsys.readouterr().err
+    assert ("unencrypted" in stderr) == (bool(key) and not expected_auth)
+    if key and not expected_auth:
+        assert "--allow-insecure-api-key" in stderr
+    snippet = _run_connect(
+        base_url=url, target="python", model="explicit", allow_insecure_api_key=opt_in
+    )
+    assert ('api_key=os.environ.get("RAPID_MLX_API_KEY")' in snippet) == expected_auth
+    assert ("export RAPID_MLX_API_KEY=" in snippet) == expected_auth
+    if not expected_auth:
+        assert "rerun with an HTTPS URL or --allow-insecure-api-key" in snippet
+    assert "test-key" not in snippet + output + stderr
+    banner = _run_connect(base_url=url, allow_insecure_api_key=opt_in)
+    assert f"Ready: {expected_base}" in banner
+    assert requests[-1] == expected_base + "/healthz"
+
+
+def test_connect_insecure_key_flag_is_explicit():
+    from rapid_mlx.cli_parser import build_parser
+
+    parser = build_parser()
+    assert not parser.parse_args(["connect"]).allow_insecure_api_key
+    assert parser.parse_args(
+        ["connect", "--allow-insecure-api-key"]
+    ).allow_insecure_api_key
