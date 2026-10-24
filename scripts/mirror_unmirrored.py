@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import json
+import time
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -84,3 +85,63 @@ def load_unmirrored(
             since=since,
         )
     return entries
+
+
+def load_published_unmirrored(
+    url: str = "https://models.rapidmlx.com/api/mirror-state",
+) -> dict[str, UnmirroredEntry | None]:
+    """Read autopilot removals so scheduled audits need no registry PR."""
+    import urllib.request
+
+    request = urllib.request.Request(
+        url, headers={"User-Agent": "Mozilla/5.0 (rapid-mlx mirror-state)"}
+    )
+    deadline = time.monotonic() + 15
+    body = bytearray()
+    with urllib.request.urlopen(request, timeout=15) as response:
+        while True:
+            # read1 performs at most one buffered/socket read, so a trickling
+            # response cannot hide indefinitely inside a full-body read.
+            chunk = response.read1(65536)
+            if time.monotonic() > deadline:
+                raise TimeoutError("published mirror state deadline exceeded")
+            body.extend(chunk)
+            if len(body) > 1024 * 1024:
+                raise ValueError("published mirror state exceeds 1 MiB")
+            if not chunk:
+                break
+    payload = json.loads(body)
+    if not isinstance(payload, dict):
+        raise ValueError("published mirror state must be an object")
+    result: dict[str, UnmirroredEntry | None] = {}
+    for repo, value in payload.items():
+        if not isinstance(repo, str) or not isinstance(value, dict):
+            raise ValueError("invalid published mirror state")
+        timestamps = {}
+        for key in ("removedAt", "mirroredSince"):
+            if key not in value:
+                continue
+            timestamp = value[key]
+            if not isinstance(timestamp, str) or not timestamp:
+                raise ValueError("invalid published mirror state timestamp")
+            parsed = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+            timestamps[key] = (
+                parsed.replace(tzinfo=timezone.utc) if parsed.tzinfo is None else parsed
+            )
+        if not timestamps:
+            raise ValueError("published mirror state has no state timestamp")
+        # A returned repository may retain its historical removal timestamp.
+        # The latest event wins; equal timestamps conservatively retain removal.
+        removed_at = timestamps.get("removedAt")
+        mirrored_since = timestamps.get("mirroredSince")
+        if mirrored_since is not None and (
+            removed_at is None or mirrored_since > removed_at
+        ):
+            result[repo] = None
+        else:
+            result[repo] = UnmirroredEntry(
+                hf_path=repo,
+                reason="usage-driven mirror removal; Hugging Face fallback",
+                since=removed_at.date().isoformat(),
+            )
+    return result
