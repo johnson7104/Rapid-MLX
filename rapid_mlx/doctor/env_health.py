@@ -10,8 +10,8 @@ optional dev tools. The user runs ``rapid-mlx doctor`` to answer one question
 * never escalate to sudo or read user data outside ``~/.cache/huggingface``;
 * report a deterministic status (✓ / ⚠ / ✗) with a one-line label.
 
-On a warm cache, ``rapid-mlx doctor`` targets five seconds, dominated by the
-single two-second network HEAD against ``huggingface.co``. Built-in I/O and
+``rapid-mlx doctor`` uses a twenty-second scheduling budget to accommodate
+cold package imports while reserving time for later checks. Built-in I/O and
 subprocess probes have explicit timeouts, and timeout results downgrade to ⚠
 or skipped — never ✗.
 
@@ -295,7 +295,8 @@ _RUNTIME_OVERRIDE_REPAIR_HINT_TEMPLATE = (
     "replaces it — install the current Rapid-MLX Desktop.app (its DMG ships a "
     "sidecar), then remove {root} and relaunch so the bundled sidecar is used"
 )
-_DOCTOR_BUDGET_S = 5.0
+_DOCTOR_BUDGET_S = 20.0
+_DOCTOR_FOLLOWUP_RESERVE_S = 5.0
 _DOCTOR_DEEP_BUDGET_S = 30.0
 _IMPORT_PROBE_TIMEOUT_S = 20.0
 # Leave enough scheduling-budget headroom for subprocess timeout cleanup, report
@@ -1108,8 +1109,9 @@ def _add_inconclusive_import(
     module: str,
     sidecar_root: Path | None,
     exercise: bool = False,
+    timeout_status: CheckStatus = CheckStatus.WARN,
 ) -> bool:
-    """Render an inconclusive import as a warning, never a false failure."""
+    """Render an inconclusive import without claiming a confirmed failure."""
     outcome = _import_probe_outcome(
         runtime,
         module,
@@ -1145,7 +1147,9 @@ def _add_inconclusive_import(
     )
     section.add(
         f"{label}{version_text} importability unknown — doctor probe {reason}",
-        CheckStatus.WARN,
+        timeout_status
+        if outcome is _ImportProbeOutcome.TIMED_OUT
+        else CheckStatus.WARN,
         detail=(
             f"distribution={label} module={module} outcome={outcome.value}; "
             f"{retry}; "
@@ -2006,7 +2010,7 @@ def _pil_importable(
     without relying on the version-specific moment Pillow first touches
     ``_imaging``. ``PIL.Image`` + a 1×1 allocation is microsecond-cheap and
     does NOT pull torch the way a real ``import mlx_vlm`` would, so it stays
-    well within Doctor's five-second target. ANY failure (missing, shadowed, broken
+    well within Doctor's scheduling budget. ANY failure (missing, shadowed, broken
     native ext) ⇒ not importable."""
     if runtime is not None and _runtime_uses_context(runtime):
         probe = _probe_runtime(
@@ -2397,7 +2401,7 @@ def section_optional_packages() -> Section:
                 continue
             if dist == "mlx-audio":
                 missing: list[str] = []
-                inconclusive: list[str] = []
+                inconclusive: dict[str, _ImportProbeOutcome] = {}
                 for distribution, module in audio_contract:
                     if _module_available(
                         module,
@@ -2409,7 +2413,7 @@ def section_optional_packages() -> Section:
                         _ImportProbeOutcome.TIMED_OUT,
                         _ImportProbeOutcome.UNVERIFIED,
                     }:
-                        inconclusive.append(distribution)
+                        inconclusive[distribution] = outcome
                     else:
                         missing.append(distribution)
                 if inconclusive:
@@ -2417,11 +2421,21 @@ def section_optional_packages() -> Section:
                     s.add(
                         f"{label} {ver} importability unknown — doctor could "
                         f"not verify: {inconclusive_text}",
-                        CheckStatus.WARN,
+                        CheckStatus.SKIPPED
+                        if all(
+                            o is _ImportProbeOutcome.TIMED_OUT
+                            for o in inconclusive.values()
+                        )
+                        else CheckStatus.WARN,
                         detail=(
                             f"distribution={dist} version={ver} "
-                            f"inconclusive={inconclusive_text}; rerun doctor "
-                            "after cold imports settle; this result does not "
+                            f"inconclusive={inconclusive_text}; "
+                            + (
+                                "inspect the dependency imports directly"
+                                if _DOCTOR_DEEP_MODE
+                                else "rerun doctor with --deep"
+                            )
+                            + "; this result does not "
                             "indicate that reinstall or rollback is needed"
                         ),
                     )
@@ -2452,6 +2466,7 @@ def section_optional_packages() -> Section:
                     s,
                     label=label,
                     version=ver,
+                    timeout_status=CheckStatus.SKIPPED,
                     runtime=runtime,
                     module="PIL.Image",
                     sidecar_root=sidecar_root,
@@ -2477,6 +2492,7 @@ def section_optional_packages() -> Section:
                 s,
                 label=label,
                 version=ver,
+                timeout_status=CheckStatus.SKIPPED,
                 runtime=runtime,
                 module=module,
                 sidecar_root=sidecar_root,
@@ -2624,6 +2640,7 @@ def section_optional_packages() -> Section:
                 s,
                 label="mlx-vlm 0.5.0+ (dflash extras)",
                 version=None,
+                timeout_status=CheckStatus.SKIPPED,
                 runtime=runtime,
                 module="PIL.Image",
                 sidecar_root=sidecar_root,
@@ -2647,6 +2664,7 @@ def section_optional_packages() -> Section:
                 s,
                 label="mlx-vlm 0.5.0+ (dflash extras)",
                 version=None,
+                timeout_status=CheckStatus.SKIPPED,
                 runtime=runtime,
                 module=_DISTRIBUTION_MODULES["mlx-vlm"],
                 sidecar_root=sidecar_root,
@@ -2798,7 +2816,7 @@ def section_hf_cache() -> Section:
 # Single, time-boxed network probe. The whole point is to catch "user is
 # behind a proxy / offline / DNS broken" early — not to audit reachability
 # of every endpoint we ever talk to. A 2 s budget keeps the worst-case
-# typical Doctor runtime under the five-second target when the resolver hangs.
+# typical Doctor runtime within the scheduling budget when the resolver hangs.
 _HF_PROBE_URL = "https://huggingface.co"
 _HF_PROBE_TIMEOUT_S = 2.0
 _HF_PROBE_SCRIPT = r"""
@@ -3887,13 +3905,13 @@ def _budget_exhausted_report(
 ) -> Report:
     report = Report()
     _append_budget_exhausted_sections(
-        report, _selected_section_builders(only=only, skip=skip, deep=deep)
+        report, _selected_section_builders(only=only, skip=skip, deep=deep), deep=deep
     )
     return report
 
 
 def _append_budget_exhausted_sections(
-    report: Report, builders: Sequence[Callable[[], Section]]
+    report: Report, builders: Sequence[Callable[[], Section]], *, deep: bool = False
 ) -> None:
     """Record selected sections that could not start before the deadline."""
     for builder in builders:
@@ -3905,7 +3923,10 @@ def _append_budget_exhausted_sections(
         skipped.add(
             "Skipped: doctor time budget exhausted",
             CheckStatus.SKIPPED,
-            detail="probe did not start before the shared deadline",
+            detail=(
+                "probe did not start before the shared deadline"
+                + ("" if deep else "; rerun doctor with --deep for more time")
+            ),
             check_id=f"{_builder_id(builder)}.budget",
         )
         skipped.id = _builder_id(builder)
@@ -3948,7 +3969,9 @@ def _run_all_serialized(
         runtime_discovery_error: Exception | None = None
         for index, builder in enumerate(selected_builders):
             if time.monotonic() >= _DOCTOR_DEADLINE:
-                _append_budget_exhausted_sections(report, selected_builders[index:])
+                _append_budget_exhausted_sections(
+                    report, selected_builders[index:], deep=deep
+                )
                 break
             if builder in _RUNTIME_SECTION_BUILDERS and not runtime_selected:
                 started_at = time.monotonic()
@@ -3979,7 +4002,9 @@ def _run_all_serialized(
                     )
                     continue
                 if time.monotonic() >= _DOCTOR_DEADLINE:
-                    _append_budget_exhausted_sections(report, selected_builders[index:])
+                    _append_budget_exhausted_sections(
+                        report, selected_builders[index:], deep=deep
+                    )
                     break
             elif builder in _RUNTIME_SECTION_BUILDERS:
                 if runtime_discovery_error is not None:
@@ -4005,6 +4030,16 @@ def _run_all_serialized(
                     continue
             try:
                 started_at = time.monotonic()
+                if (
+                    not deep
+                    and _builder_id(builder) == "packages.optional"
+                    and index + 1 < len(selected_builders)
+                ):
+                    # Optional imports must leave time for cache/network/shell
+                    # and service diagnostics, even when a child hangs.
+                    _DOCTOR_DEADLINE = max(
+                        started_at, caller_deadline - _DOCTOR_FOLLOWUP_RESERVE_S
+                    )
                 report.sections.append(
                     _finish_section(builder(), builder=builder, started_at=started_at)
                 )
@@ -4019,6 +4054,8 @@ def _run_all_serialized(
                 report.sections.append(
                     _finish_section(crashed, builder=builder, started_at=started_at)
                 )
+            finally:
+                _DOCTOR_DEADLINE = caller_deadline
     finally:
         _DOCTOR_DEADLINE = None
         _DOCTOR_DEEP_MODE = False
