@@ -176,11 +176,37 @@ enum DevSnapshot {
         let snapshotPerfDefaults = UserDefaults(suiteName: "rapid.dev-snapshot.perf")!
         let snapshotStarDefaults = UserDefaults(suiteName: "rapid.dev-snapshot.github-star")!
         snapshotStarDefaults.removePersistentDomain(forName: "rapid.dev-snapshot.github-star")
-        let snapshotStarPrompt = GitHubStarPromptCoordinator(
+        snapshotStarDefaults.set(true, forKey: PromptScheduler.PromoKeys.newsletterCompleted)
+        snapshotStarDefaults.set(2, forKey: EffectiveUse.Keys.distinctDays)
+        snapshotStarDefaults.set(Calendar.current.startOfDay(for: Date()), forKey: EffectiveUse.Keys.lastDay)
+        let snapshotStarPrompt = PromptScheduler(
             defaults: snapshotStarDefaults,
             quietWindow: .zero,
             presentationActive: true
         )
+        if ProcessInfo.processInfo.environment["RAPID_DEV_PROMO_ONLY"] == "1" {
+            let newsletterDefaults = UserDefaults(suiteName: "rapid.dev-snapshot.newsletter")!
+            newsletterDefaults.removePersistentDomain(forName: "rapid.dev-snapshot.newsletter")
+            let newsletter = PromptScheduler(defaults: newsletterDefaults,
+                                             quietWindow: .zero, presentationActive: true)
+            newsletter.productValueDelivered(.chatReply)
+            newsletter.productValueDelivered(.generatedImage)
+            snapshotStarDefaults.set(PromptScheduler.initialWorkloadThreshold,
+                                     forKey: EffectiveUse.Keys.total)
+            snapshotStarPrompt.startMonitoringUserActivity()
+            func card(_ view: some View) -> AnyView {
+                AnyView(ZStack(alignment: .bottomTrailing) {
+                    RapidTheme.surfaceCanvas
+                    view.padding(.trailing, 16).padding(.bottom, 40)
+                }.frame(width: 720, height: 560))
+            }
+            render(card(NewsletterPromptCard().environment(newsletter)),
+                   to: "\(dir)/newsletter-value-moment.png")
+            render(card(GitHubStarPromptCard().environment(snapshotStarPrompt)),
+                   to: "\(dir)/github-star-value-moment.png")
+            NSApp.terminate(nil)
+            return
+        }
         snapshotPerfDefaults.removePersistentDomain(forName: "rapid.dev-snapshot.perf")
         let snapshotPerfConfig = ModelPerfConfigStore(defaults: snapshotPerfDefaults)
 
@@ -632,10 +658,8 @@ enum DevSnapshot {
         // window. Drive the real workload gate, then complete it immediately
         // after capture so it cannot leak into the rest of the snapshot
         // matrix below.
-        snapshotStarDefaults.set(
-            GitHubStarPromptCoordinator.initialWorkloadThreshold - 1,
-            forKey: GitHubStarPromptCoordinator.Keys.totalSuccessfulActions
-        )
+        snapshotStarDefaults.set(PromptScheduler.initialWorkloadThreshold - 1,
+                                 forKey: EffectiveUse.Keys.total)
         snapshotStarPrompt.productValueDelivered(.chatReply)
         render(
             AnyView(
@@ -651,6 +675,26 @@ enum DevSnapshot {
             to: "\(dir)/github-star-value-moment.png"
         )
         snapshotStarPrompt.repositoryOpened()
+
+        let newsletterDefaults = UserDefaults(suiteName: "rapid.dev-snapshot.newsletter")!
+        newsletterDefaults.removePersistentDomain(forName: "rapid.dev-snapshot.newsletter")
+        let newsletterPrompt = PromptScheduler(defaults: newsletterDefaults,
+                                               quietWindow: .zero, presentationActive: true)
+        newsletterPrompt.productValueDelivered(.chatReply)
+        newsletterPrompt.productValueDelivered(.generatedImage)
+        render(
+            AnyView(
+                ZStack(alignment: .bottomTrailing) {
+                    RapidTheme.surfaceCanvas
+                    NewsletterPromptCard()
+                        .padding(.trailing, 16)
+                        .padding(.bottom, 40)
+                }
+                .environment(newsletterPrompt)
+                .frame(width: 720, height: 560)
+            ),
+            to: "\(dir)/newsletter-value-moment.png"
+        )
 
         // Images tab (empty state — no results, catalog not yet resolved).
         render(imagesView(width: 700, height: 640), to: "\(dir)/images-empty.png")
