@@ -10,7 +10,8 @@ import Foundation
 /// state, and the recent (already-scrubbed) log tail — and lets the
 /// user save it to share.
 ///
-/// Privacy: every free-text line runs back through ``LogScrubber``
+/// Privacy: the complete report redacts the home directory and username,
+/// and runs back through ``LogScrubber``
 /// so tokens / auth headers can't ride along, and the machine section
 /// carries only the same non-identifying facts telemetry already
 /// reports (chip, RAM, macOS) — never a username, hostname, or path.
@@ -18,7 +19,12 @@ enum DiagnosticsBundle {
 
     /// Build the report text from live diagnostics.
     @MainActor
-    static func makeReport(server: ServerManager) -> String {
+    static func makeReport(
+        server: ServerManager,
+        homeDirectory: String = NSHomeDirectory(),
+        username: String = NSUserName(),
+        fullName: String = NSFullUserName()
+    ) -> String {
         let hw = MacHardware.detect()
         let version = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "unknown"
         let build = Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "unknown"
@@ -57,7 +63,7 @@ enum DiagnosticsBundle {
                 line("  " + LogScrubber.scrub(l))
             }
         }
-        return out
+        return redact(out, homeDirectory: homeDirectory, username: username, fullName: fullName)
     }
 
     /// Present a save panel and write the report. Reveals the saved
@@ -86,6 +92,55 @@ enum DiagnosticsBundle {
     }
 
     // MARK: - Helpers
+
+    /// Owner policy: redact home paths anywhere, including backup/escaped
+    /// paths. Known account names of at least three characters are redacted
+    /// as whole tokens, even when they are also ordinary words. Unknown names
+    /// in free text cannot be identified reliably and remain a residual risk.
+    static func redact(
+        _ report: String, homeDirectory: String, username: String, fullName: String = ""
+    ) -> String {
+        func identityPattern(_ value: String) -> String {
+            // Match literal, shell/JSON-escaped, and percent-encoded text,
+            // including mixed encodings and mixed-case account paths.
+            value.unicodeScalars.map { scalar in
+                let literal = NSRegularExpression.escapedPattern(for: String(scalar))
+                let encoded = [String(scalar), String(scalar).lowercased(), String(scalar).uppercased()]
+                    .map { $0.utf8.map { String(format: "%%%02X", $0) }.joined() }
+                    .joined(separator: "|")
+                let jsonPattern = [String(scalar), String(scalar).lowercased(), String(scalar).uppercased()]
+                    .map { value in
+                        let escaped = value.utf16.map { String(format: "\\u%04X", $0) }.joined()
+                        return NSRegularExpression.escapedPattern(for: escaped)
+                    }.joined(separator: "|")
+                return "(?:" + literal + "|(?i:" + encoded + ")|" + jsonPattern + #"|\\"# + literal + ")"
+            }.joined()
+        }
+        func replace(_ text: String, pattern: String, with placeholder: String) -> String {
+            text.replacingOccurrences(of: pattern, with: placeholder,
+                                      options: [.regularExpression, .caseInsensitive])
+        }
+
+        let home = homeDirectory.hasSuffix("/") ? String(homeDirectory.dropLast()) : homeDirectory
+        var paths: [String] = []
+        if !home.isEmpty && home != "/" { paths.append(identityPattern(home) + #"(?![\p{L}\p{N}_.+-])"#) }
+        // Also cover other accounts, embedded backup paths, and file:// URLs.
+        // Encoded/escaped separators terminate the account component.
+        let account = #"(?:\\(?!u002f)[^/\r\n]|%(?!2f|09|0a|0d|3f|23|26|3d)[0-9a-f]{2}|[^/\s\\%"'<>:,;)\]}?!#&=])+"#
+        paths.append(identityPattern("/Users/") + account)
+        // A literal ~/ path is already anonymous; ~account/ is not.
+        paths.append(identityPattern("~") + account + "(?=" + identityPattern("/") + ")")
+        var result = replace(report, pattern: paths.joined(separator: "|"), with: "~")
+
+        let names = [username, fullName].filter { $0.count >= 3 }.sorted { $0.count > $1.count }
+        if !names.isEmpty {
+            let tokens = names.map {
+                #"(?<![\p{L}\p{N}_])"# + identityPattern($0) + #"(?![\p{L}\p{N}_])"#
+            }.joined(separator: "|")
+            result = replace(result, pattern: tokens, with: "<redacted>")
+        }
+        return LogScrubber.scrub(result)
+    }
 
     static let logTailCount = 300
 
