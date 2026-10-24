@@ -577,6 +577,8 @@ jobs:
             tests/test_mllm_media_prefix_cache.py \
             tests/test_mlx_vlm_vendored_apc_adapters.py \
             tests/test_mlx_vlm_vendored_apc_support.py \
+            tests/test_mlx_vlm_vendored_inputs.py \
+            tests/test_remote_audio_security.py \
             tests/test_mlx_vlm_vendored_generate.py \
             tests/test_mlx_vlm_vendored_speculative.py \
             tests/test_mlx_vlm_vendored_drafters.py \
@@ -617,7 +619,6 @@ jobs:
             tests/test_server_dependency_hints.py \
             tests/test_forced_alignment_route_hardening.py \
             tests/test_sa3_checkpoint_consent.py \
-            tests/test_security_hardening.py \
             tests/test_muse_glimmer_model.py \
             tests/test_g9v3_model.py \
             tests/test_flint_model.py \

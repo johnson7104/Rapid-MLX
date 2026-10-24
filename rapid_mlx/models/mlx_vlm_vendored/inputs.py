@@ -30,10 +30,10 @@ from dataclasses import dataclass, fields
 from io import BytesIO
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
+from urllib.parse import urlsplit
 
 import mlx.core as mx
 import numpy as np
-import requests
 from PIL import Image, ImageOps
 from mlx_vlm.models.base import BaseImageProcessor  # VENDOR-DEVIATION(redirect)
 
@@ -65,14 +65,30 @@ def load_image(image_source: Union[str, Path, BytesIO, Image.Image], timeout: in
                     )
                 _, data = image_source.split(",", 1)
                 image_source = BytesIO(base64.b64decode(data))
-            if isinstance(image_source, str) and image_source.startswith(
-                ("http://", "https://")
+            if (
+                isinstance(image_source, str)
+                and urlsplit(image_source).scheme
+                and "://" not in image_source
+                and Path(image_source).is_file()
             ):
-                with requests.get(
-                    image_source, stream=True, timeout=timeout
-                ) as response:
-                    response.raise_for_status()
-                    image_source = BytesIO(response.content)
+                image_source = str(Path(image_source).resolve())
+            if isinstance(image_source, str) and image_source[:7].lower() == "file://":
+                from rapid_mlx.models.mllm import resolve_local_media_uri
+
+                image_source = resolve_local_media_uri(image_source)
+            if isinstance(image_source, str) and urlsplit(image_source).scheme.lower() in (
+                "http",
+                "https",
+            ):
+                # VENDOR-DEVIATION(upstream-bugfix): never let a decoder fetch
+                # untrusted URLs outside Rapid's DNS-pinned media transport.
+                from rapid_mlx.models.mllm import _temp_manager, download_image
+
+                downloaded = download_image(image_source, timeout=timeout)
+                try:
+                    image_source = BytesIO(Path(downloaded).read_bytes())
+                finally:
+                    _temp_manager.cleanup(downloaded)
 
             image = Image.open(image_source)
     except ValueError:
@@ -303,20 +319,21 @@ def load_audio(
 
     if isinstance(file, Path):
         file = str(file)
-    if isinstance(file, str) and file.startswith(("http://", "https://")):
+    # VENDOR-DEVIATION(upstream-bugfix): resolve URLs through the shared
+    # media guard before audio decoders receive input (including redirects).
+    from rapid_mlx.models.mllm import process_audio_input
+
+    if isinstance(file, str) and file.lower().startswith(("http://", "https://")):
         try:
-            # VENDOR-DEVIATION(upstream-bugfix): close the streamed response
-            # on success and every decoder/error path instead of leaking it.
-            with requests.get(file, stream=True, timeout=timeout) as response:
-                response.raise_for_status()
-                audio, sample_rate = read_audio(
-                    BytesIO(response.content), dtype="float32"
-                )
-        except Exception as e:
+            source = process_audio_input(file, timeout=timeout)
+            audio, sample_rate = read_audio(source, dtype="float32")
+        except Exception as exc:
             raise ValueError(
-                f"Failed to load audio from URL: {file} with error {e}"
-            ) from e
+                f"Failed to load audio from URL: {file} with error {exc}"
+            ) from exc
     else:
+        if isinstance(file, str):
+            file = process_audio_input(file, timeout=timeout)
         audio, sample_rate = read_audio(file, dtype="float32")
 
     # Upstream 0.7.2 downmixes before resampling: ``read_audio`` returns
@@ -419,15 +436,35 @@ def load_video(
     max_frames = resolved.max_frames
     frame_factor = resolved.frame_factor
 
-    if video_path.startswith("file://"):
-        video_path = video_path[7:]
+    # VENDOR-DEVIATION(upstream-bugfix): OpenCV must never fetch arbitrary
+    # remote URLs itself; reuse the guarded downloader before opening frames.
+    if (
+        urlsplit(video_path).scheme
+        and "://" not in video_path
+        and Path(video_path).is_file()
+    ):
+        video_path = str(Path(video_path).resolve())
+    cleanup_download = None
+    if urlsplit(video_path).scheme.lower() in ("http", "https"):
+        from rapid_mlx.models.mllm import _temp_manager, download_video
 
-    cap = cv2.VideoCapture(video_path)
+        video_path = download_video(video_path)
+        cleanup_download = _temp_manager.cleanup
+    elif urlsplit(video_path).scheme and video_path[:7].lower() != "file://":
+        raise ValueError("Remote video URL must use http(s)")
+
+    if video_path[:7].lower() == "file://":
+        from rapid_mlx.models.mllm import resolve_local_media_uri
+
+        video_path = resolve_local_media_uri(video_path)
+
+    cap = None
     # VENDOR-DEVIATION(upstream-bugfix): the native capture handle leaked on
     # any exception after open (failed opens, frame sampler errors, index
     # validation, cap.read/cvtColor failures); everything from the isOpened
     # check on runs under try/finally so the handle is always released.
     try:
+        cap = cv2.VideoCapture(video_path)
         if not cap.isOpened():
             raise ValueError(f"Cannot open video: {video_path}")
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
@@ -487,7 +524,12 @@ def load_video(
                 break
             frames.append(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
     finally:
-        cap.release()
+        try:
+            if cap is not None:
+                cap.release()
+        finally:
+            if cleanup_download is not None:
+                cleanup_download(video_path)
     if not frames:
         raise ValueError("No frames read from the video.")
 
