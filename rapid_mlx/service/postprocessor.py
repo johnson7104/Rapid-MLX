@@ -21,7 +21,9 @@ from unittest.mock import Mock
 from ..api.tool_calling import parse_tool_calls
 from ..api.utils import StreamingContentSanitizer, sanitize_output, strip_special_tokens
 from ..domain.events import StreamEvent
+from ..streaming_markers import StreamingMarkerBuffer
 from ..tool_call_authorization import call_name, declared_names, log_drop
+from ..tool_parsers.streaming import tool_openers
 
 if TYPE_CHECKING:
     from ..config.server_config import ServerConfig
@@ -435,6 +437,9 @@ class StreamingPostProcessor:
         # State
         self.accumulated_text = ""
         self._content_sanitizer = StreamingContentSanitizer()
+        self._tool_marker_buffer = StreamingMarkerBuffer(
+            tool_openers(self.tool_parser) if self.tool_parser else ()
+        )
         self._content_sanitizer_accumulates = False
         self.tool_accumulated_text = ""
         # Accumulated reasoning content (split out by the reasoning parser
@@ -2483,6 +2488,9 @@ class StreamingPostProcessor:
         """
         self.accumulated_text = ""
         self._content_sanitizer = StreamingContentSanitizer()
+        self._tool_marker_buffer = StreamingMarkerBuffer(
+            tool_openers(self.tool_parser) if self.tool_parser else ()
+        )
         self._content_sanitizer_accumulates = False
         self.tool_accumulated_text = ""
         self.accumulated_reasoning = ""
@@ -2611,7 +2619,10 @@ class StreamingPostProcessor:
         """
         events = self._process_chunk_events(output)
         if any(event.type == "tool_call" for event in events):
-            tail = self._content_sanitizer.flush()
+            tail = ""
+            if getattr(output, "tool_calls", None):
+                tail = self._content_sanitizer.process(self._tool_marker_buffer.flush())
+            tail += self._content_sanitizer.flush()
             if self._content_sanitizer_accumulates:
                 self.accumulated_text += tail
             self._insert_content_before_tool_call(events, tail, released_held=True)
@@ -2637,12 +2648,12 @@ class StreamingPostProcessor:
     @property
     def content_held(self) -> bool:
         """Whether streamed content text is held back pending later deltas."""
-        return self._content_sanitizer.holding
+        return self._content_sanitizer.holding or bool(self._tool_marker_buffer.pending)
 
     @property
     def content_consumed(self) -> int:
         """Characters of content text that have entered the hold-back."""
-        return self._content_sanitizer.consumed
+        return self._content_sanitizer.consumed + len(self._tool_marker_buffer.pending)
 
     def _process_chunk_events(self, output: GenerationOutput) -> list[StreamEvent]:
         """Build events before resolving content held across a tool boundary."""
@@ -4224,12 +4235,18 @@ class StreamingPostProcessor:
         # be silently dropped (codex round-3 CRITICAL on the streaming-
         # parser cluster PR). When a tool call DID fire, the held
         # bytes are part of the tool-call body and stay suppressed.
+        marker_tail = self._tool_marker_buffer.flush()
         if (
             self.tool_parser
             and self.tool_accumulated_text
             and (not self.tool_calls_detected or self._preserve_post_tool_content)
         ):
-            held = self.tool_parser.flush_held_content(self.tool_accumulated_text)
+            # After a call, only the parser can distinguish visible suffixes
+            # from unfinished call wire or a later implicit reasoning lane.
+            parser_text = self.tool_accumulated_text
+            if self.tool_calls_detected:
+                parser_text += marker_tail
+            held = self.tool_parser.flush_held_content(parser_text)
             # Strict-string check: ``flush_held_content`` is part of the
             # parser interface and must return a real ``str``. Defending
             # against accidental ``None`` / non-string returns avoids a
@@ -4237,6 +4254,11 @@ class StreamingPostProcessor:
             # downstream.
             if isinstance(held, str) and held:
                 events.append(StreamEvent(type="content", content=held))
+
+        if marker_tail and not self.tool_calls_detected:
+            # Queue for the shared sanitizer pass below; do not emit directly.
+            # Its older held bytes must precede this later marker suffix.
+            events.append(StreamEvent(type="content", content=marker_tail))
 
         # Every EOF content release (reasoning-parser tails, parser-held
         # bytes) is later in the same content stream than the sanitizer's
@@ -4343,6 +4365,10 @@ class StreamingPostProcessor:
         Returns {"tool_calls": [...]} if tool calls detected.
         Returns {"content": "..."} for normal content pass-through.
         """
+        content = self._tool_marker_buffer.process(content)
+        if not content:
+            return None
+
         if self._tool_suppression_released:
             # Issue #1359 — a prior unclosed tool-call block blew the
             # suppression budget; tool detection is disabled for the rest of
@@ -4350,7 +4376,14 @@ class StreamingPostProcessor:
             self.tool_accumulated_text += content
             return {"content": content}
 
-        if not self.tool_markup_possible and "<" not in content and "[" not in content:
+        if (
+            not self.tool_markup_possible
+            and "<" not in content
+            and "[" not in content
+            and not any(
+                marker in content for marker in self._tool_marker_buffer.markers
+            )
+        ):
             # The hardcoded ``<``/``[`` heuristic catches every parser
             # whose wire markers open with one of those chars. The
             # gemma4 stripped wire form is the exception: on
