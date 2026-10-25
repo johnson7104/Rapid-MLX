@@ -61,7 +61,9 @@ class Engine(BaseEngine):
         "Private thought.</think></arg_value><arg_key>command</arg_key><arg_value>pwd</arg_value></tool_call>",
     ],
 )
-def test_flint_routes(surface, stream, later, raw, step, expected_literal=None):
+def test_flint_routes(
+    surface, stream, later, raw, step, expected_literal=None, enable_thinking=True
+):
     cfg = reset_config()
     cfg.model_name = "flint-40b-a2.5b-4bit"
     cfg.no_thinking = False
@@ -96,7 +98,7 @@ def test_flint_routes(surface, stream, later, raw, step, expected_literal=None):
         model=cfg.model_name,
         stream=stream,
         tools=TOOLS,
-        chat_template_kwargs={"enable_thinking": True},
+        chat_template_kwargs={"enable_thinking": enable_thinking},
     )
     if surface == "chat":
         body["messages"] = history
@@ -104,7 +106,7 @@ def test_flint_routes(surface, stream, later, raw, step, expected_literal=None):
     elif surface == "messages":
         body.pop("chat_template_kwargs")
         body["max_tokens"] = 1024
-        body["thinking"] = {"type": "enabled"}
+        body["thinking"] = {"type": "enabled" if enable_thinking else "disabled"}
         body["messages"] = history[:1]
         body["tools"] = [
             {"name": "run_shell_command", "input_schema": {"type": "object"}}
@@ -211,6 +213,26 @@ def test_flint_routes(surface, stream, later, raw, step, expected_literal=None):
                 for c in i["content"]
             )
             calls = [i for i in packets[0]["output"] if i["type"] == "function_call"]
+        if surface == "responses" and stream:
+
+            def message_text(items):
+                return "".join(
+                    c["text"]
+                    for i in items
+                    if i["type"] == "message"
+                    for c in i["content"]
+                )
+
+            for packet in packets:
+                if packet.get("type") == "response.output_text.done":
+                    assert packet["text"] == visible
+                elif (
+                    packet.get("type") == "response.output_item.done"
+                    and packet["item"]["type"] == "message"
+                ):
+                    assert message_text([packet["item"]]) == visible
+                elif packet.get("type") == "response.completed":
+                    assert message_text(packet["response"]["output"]) == visible
         if expected_literal is not None:
             assert visible == expected_literal
             assert not calls
