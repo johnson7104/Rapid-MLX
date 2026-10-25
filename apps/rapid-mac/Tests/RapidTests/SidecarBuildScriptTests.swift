@@ -110,9 +110,17 @@ struct SidecarBuildScriptTests {
                 "A newer build host must not make the sidecar require that host's macOS.")
         #expect(script.contains("^Tag: .*macosx_14_0_arm64$"),
                 "The build must fail closed if pip does not install the requested compatible wheels.")
-        #expect(script.contains(#""mlx==${MLX_VERSION}""#))
-        #expect(script.contains(#""mlx-metal==${MLX_METAL_VERSION}""#),
-                "Core and metallib wheels must be replaced as one matched pair.")
+        let installs = script.replacingOccurrences(of: "\\\n", with: "")
+            .components(separatedBy: "\n")
+            .filter { $0.hasPrefix(#""$STAGE/python/bin/python3.12" -m pip install "#) }
+        #expect(installs.count == 2)
+        let locked = try #require(installs.first { $0.contains(#"--requirement "$SIDECAR_LOCK""#) })
+        #expect(locked.contains(" --require-hashes "))
+        #expect(locked.contains(" --only-binary=:all: "))
+        let source = try #require(installs.first { $0.contains(#""$TENSORFOLD_RUNTIME_SPEC""#) })
+        #expect(source.contains(#""${RAPID_MLX_INSTALL_TARGET}[audio-desktop,computer-use]""#))
+        #expect(source.contains(" --no-deps "),
+                "The application and runtime install must not resolve dependencies outside the lock.")
     }
 
     @Test("Desktop image stack is pinned and the full mflux runtime is proven")
@@ -154,7 +162,7 @@ struct SidecarBuildScriptTests {
         #expect(pyproject.contains("\naudio-desktop = ["),
                 "The bounded desktop audio dependency group must remain separately installable.")
         #expect(pyproject.contains(#""mlx-audio>=0.5.3,<0.6""#))
-        #expect(pyproject.contains(#""soundfile>=0.12.0""#))
+        #expect(pyproject.contains(#""soundfile>=0.12.0,<0.15""#))
         #expect(script.contains(#""${RAPID_MLX_INSTALL_TARGET}[audio-desktop,computer-use]""#),
                 "The desktop sidecar must install the bounded audio and Computer Use dependency sets.")
         #expect(script.contains(#"RAPID_MLX_WHEEL="${RAPID_MLX_WHEEL:-}""#),
