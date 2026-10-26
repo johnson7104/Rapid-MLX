@@ -658,6 +658,7 @@ class STTEngine:
             from mlx_audio.stt.utils import load_model
 
             from ..model_aliases import resolve_revision
+            from ..model_metadata import resolve_pinned_cached_snapshot
 
             model_path = self.model_name
             load_options = {}
@@ -666,8 +667,13 @@ class STTEngine:
 
                 load_options["model_name_parts"] = get_model_name_parts(self.model_name)
 
-                model_path = model_downloads.snapshot_download(
-                    model_path, allow_patterns=list(DEFAULT_ALLOW_PATTERNS)
+                cached = resolve_pinned_cached_snapshot(model_path)
+                model_path = (
+                    str(cached)
+                    if cached is not None
+                    else model_downloads.snapshot_download(
+                        model_path, allow_patterns=list(DEFAULT_ALLOW_PATTERNS)
+                    )
                 )
             self.model = load_model(model_path, **load_options)
             # Prefer the backend metadata after loading so renamed/private
@@ -756,10 +762,16 @@ class STTEngine:
         try:
             from .. import model_downloads
 
-            local_only = (
-                {"local_files_only": True} if model_downloads.disabled() else {}
-            )
-            processor = WhisperProcessor.from_pretrained(processor_source, **local_only)
+            try:
+                processor = WhisperProcessor.from_pretrained(
+                    processor_source, local_files_only=True
+                )
+            except OSError:
+                # Transformers reports missing local processor assets as OSError.
+                # Keep the existing online lookup only for a cache miss.
+                if model_downloads.disabled():
+                    raise
+                processor = WhisperProcessor.from_pretrained(processor_source)
         except Exception as e:  # noqa: BLE001
             # Network failure, gated repo, unsupported revision — log
             # and bail. The upstream ValueError surfaces at first
