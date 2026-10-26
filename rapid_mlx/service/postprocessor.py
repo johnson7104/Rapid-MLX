@@ -28,6 +28,7 @@ from ..tool_parsers.streaming import tool_openers
 if TYPE_CHECKING:
     from ..config.server_config import ServerConfig
     from ..engine.base import GenerationOutput
+    from ..prompt_parse_context import PromptParseContext
 
 logger = logging.getLogger(__name__)
 
@@ -208,6 +209,7 @@ class StreamingPostProcessor:
         tool_authorization_names: set[str] | None = None,
     ):
         self.cfg = cfg
+        self.prompt_parse_context: PromptParseContext | None = None
         if tools_requested is None:
             # Backward-compatible inference for direct/internal callers that
             # already pass the request payload but predate this constructor
@@ -2480,6 +2482,7 @@ class StreamingPostProcessor:
         are request-local. Injected singleton parsers are not reset here
         because that would clear another active stream's parser state.
         """
+        self.prompt_parse_context = None
         self.accumulated_text = ""
         self._content_sanitizer = StreamingContentSanitizer()
         self._tool_marker_buffer = StreamingMarkerBuffer(
@@ -2611,6 +2614,8 @@ class StreamingPostProcessor:
 
         Returns a list of StreamEvents (may be empty if content is suppressed).
         """
+        if getattr(output, "prompt_parse_context", None) is not None:
+            self.prompt_parse_context = output.prompt_parse_context
         events = self._process_chunk_events(output)
         if any(event.type == "tool_call" for event in events):
             tail = ""
