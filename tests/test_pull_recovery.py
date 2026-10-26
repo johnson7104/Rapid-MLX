@@ -8,7 +8,10 @@ import httpx
 import pytest
 
 from rapid_mlx import cli
-from tests.pull_integrity_helpers import hub_integrity_metadata, snapshot_tree  # noqa: F401
+from tests.pull_integrity_helpers import (  # noqa: F401
+    hub_integrity_metadata,
+    snapshot_tree,
+)
 
 
 def test_pull_disk_full_has_retry_command(monkeypatch, tmp_path, capsys):
@@ -86,6 +89,7 @@ def test_retry_is_bounded_for_network_and_server_errors(monkeypatch):
         _hub_error(HfHubHTTPError, 503),
         wrapped,
         httpx.RemoteProtocolError("peer closed with secret URL"),
+        httpx.ProxyError("proxy rejected secret URL"),
     ):
         calls = []
 
@@ -181,6 +185,12 @@ def test_gated_and_misspelled_repo_guidance(monkeypatch):
     assert "could not reach Hugging Face" in protocol
     assert "secret URL" not in protocol
 
+    proxy = cli.render_hub_error(
+        httpx.ProxyError("403 secret proxy URL"), "owner/model"
+    )
+    assert "could not reach Hugging Face" in proxy
+    assert "secret proxy URL" not in proxy
+
     server_error = cli.render_hub_error(
         _hub_error(HfHubHTTPError, 503),
         "owner/model",
@@ -190,6 +200,44 @@ def test_gated_and_misspelled_repo_guidance(monkeypatch):
     monkeypatch.setattr("rapid_mlx.model_aliases.suggest_similar", lambda _name: [])
     monkeypatch.setattr("rapid_mlx.model_aliases.list_builtin_aliases", lambda: {})
     assert "rapid-mlx models" in cli._hub_not_found_hint("owner/unknown")
+
+
+def test_proxy_rejection_is_a_network_failure():
+    from rapid_mlx.telemetry.model_events import pull_error_class
+
+    assert pull_error_class(httpx.ProxyError("403 Forbidden")) == "network"
+
+
+@pytest.mark.parametrize("emit_lifecycle_event", [False, True])
+def test_mirror_only_integrity_failure_has_safe_cli_guidance(
+    monkeypatch, tmp_path, capsys, emit_lifecycle_event
+):
+    from rapid_mlx._mirror import MirrorOnlyPullError
+
+    events = []
+    monkeypatch.setattr(
+        "rapid_mlx.telemetry.model_events.emit_model_pull_failed",
+        lambda *args, **kwargs: events.append((args, kwargs)),
+    )
+    monkeypatch.setattr(cli, "_hf_cache_root", lambda _repo: tmp_path)
+    monkeypatch.setattr(
+        cli,
+        "_try_mirror_prefetch",
+        lambda *_a, **_kw: (_ for _ in ()).throw(
+            MirrorOnlyPullError("private file path and digest")
+        ),
+    )
+    with pytest.raises(SystemExit) as raised:
+        cli._pull_repository(
+            argparse.Namespace(model="owner/repo", bits=None, format=None),
+            emit_lifecycle_event=emit_lifecycle_event,
+        )
+    assert raised.value.code == 1
+    assert len(events) == int(emit_lifecycle_event)
+    stderr = capsys.readouterr().err
+    assert "cannot verify every file" in stderr
+    assert "Retry: rapid-mlx pull owner/repo" in stderr
+    assert "private file path and digest" not in stderr
 
 
 @pytest.mark.parametrize(

@@ -1661,11 +1661,25 @@ def _check_disk_space(
         from huggingface_hub import model_info, try_to_load_from_cache
         from huggingface_hub.constants import HF_HUB_CACHE
 
-        info = (
-            model_info(model_name, revision=revision_override, files_metadata=True)
-            if revision_override is not None
-            else model_info(model_name, files_metadata=True)
+        from rapid_mlx._mirror import _packaged_digest_info
+        from rapid_mlx.model_aliases import subfolder_allow_patterns
+
+        selection = (
+            allow_patterns
+            if allow_patterns is not None
+            else subfolder_allow_patterns(model_name)
         )
+        info = (
+            _packaged_digest_info(model_name, revision_override, selection)
+            if revision_override is not None
+            else None
+        )
+        if info is None:
+            info = (
+                model_info(model_name, revision=revision_override, files_metadata=True)
+                if revision_override is not None
+                else model_info(model_name, files_metadata=True)
+            )
         revision = getattr(info, "sha", None)
         if allow_patterns is not None:
             from fnmatch import fnmatchcase
@@ -2608,7 +2622,7 @@ def _is_transient_hub_error(exc: BaseException) -> bool:
             current.response, "status_code", None
         ) in (401, 403, 404):
             return False
-        if isinstance(current, (httpx.RemoteProtocolError, ChunkedEncodingError)):
+        if isinstance(current, (httpx.TransportError, ChunkedEncodingError)):
             transient = True
         if isinstance(current, HfHubHTTPError) and getattr(
             current.response, "status_code", None
@@ -2686,6 +2700,8 @@ def render_hub_error(exc: BaseException, model_id: str) -> str | None:
     )
     from requests import exceptions as requests_exceptions
 
+    from rapid_mlx._mirror import MirrorOnlyPullError
+
     rendered_model_id = _safe_hub_model_id(model_id)
     current: BaseException | None = exc
     seen: set[int] = set()
@@ -2693,6 +2709,14 @@ def render_hub_error(exc: BaseException, model_id: str) -> str | None:
         if current is None or id(current) in seen:
             break
         seen.add(id(current))
+
+        if isinstance(current, MirrorOnlyPullError):
+            return (
+                f"  Error: the configured mirror cannot verify every file for "
+                f"'{rendered_model_id}' at its pinned revision.\n"
+                "  Check the packaged model digests and mirror files, "
+                "or restore Hub access before retrying."
+            )
 
         if isinstance(current, OSError) and current.errno == errno.ENOSPC:
             return (
@@ -2760,9 +2784,7 @@ def render_hub_error(exc: BaseException, model_id: str) -> str | None:
                 requests_exceptions.ConnectionError,
                 requests_exceptions.Timeout,
                 requests_exceptions.ChunkedEncodingError,
-                httpx.NetworkError,
-                httpx.TimeoutException,
-                httpx.RemoteProtocolError,
+                httpx.TransportError,
                 socket.gaierror,
                 TimeoutError,
                 urllib.error.URLError,
@@ -11160,6 +11182,12 @@ def _resolve_variant_allow_patterns(
     # None/empty/both cases all returned or raised above), so ``requested`` is
     # a real folder name string.
     requested = f"{bits}bit" if bits else (fmt or "")
+    pattern = f"{_escape_glob_literal(requested)}/*"
+    if revision:
+        from rapid_mlx._mirror import _packaged_digest_info
+
+        if _packaged_digest_info(repo_id, revision, [pattern]) is not None:
+            return [pattern]
     try:
         tree = list(
             HfApi().list_repo_tree(
@@ -11173,7 +11201,7 @@ def _resolve_variant_allow_patterns(
         raise VariantNotFoundError(repo_id, requested, available=folders)
     # The folder is validated to exist literally; escape glob metacharacters so
     # a weird folder name can't broaden the match to other siblings.
-    return [f"{_escape_glob_literal(requested)}/*"]
+    return [pattern]
 
 
 class VariantNotFoundError(Exception):
@@ -11356,8 +11384,20 @@ def _pull_repository(
             )
         )
     except Exception as exc:
+        from rapid_mlx._mirror import MirrorOnlyPullError
         from rapid_mlx.telemetry.model_events import emit_model_pull_failed
 
+        if isinstance(exc, MirrorOnlyPullError):
+            if emit_lifecycle_event:
+                emit_model_pull_failed(
+                    exc, model_ref=repo_id, source=_mirror_out.get("source")
+                )
+            print(f"\n{render_hub_error(exc, repo_id)}\n", file=sys.stderr)
+            retry = getattr(args, "_pull_retry_command", None) or _pull_retry_command(
+                args
+            )
+            print(f"  Retry: {retry}", file=sys.stderr)
+            raise SystemExit(1) from None
         if _is_transient_hub_error(exc):
             mirror_ok = False
             print("  Mirror connection interrupted; trying Hugging Face.")
