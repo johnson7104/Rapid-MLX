@@ -179,8 +179,8 @@ final class DictationController {
     private var transcribeTask: Task<Void, Never>?
     private var transcribeRequestID: UUID?
     /// The on-disk revalidation between a hotkey tap and capture. Keeping the
-    /// task cancellable means turning dictation off while the catalog CLI is
-    /// running cannot let its stale continuation start the microphone later.
+    /// task cancellable means turning dictation off before the queued check
+    /// cannot let its stale continuation start the microphone later.
     private var beginRecordingTask: Task<Void, Never>?
     private var beginRecordingRequestID: UUID?
     /// The record-start page-in probe (see ``startRecordStartWarmup()``),
@@ -210,10 +210,13 @@ final class DictationController {
     /// nil limits `ensureServing` to cached models, which is exactly the
     /// contract here: downloading is the Download button's job, with
     /// progress the user can see.
-    private struct CatalogFacts {
+    private struct CatalogFacts: Sendable {
         let repo: String?
         let cached: Bool
+        let snapshots: [DictationSnapshot.Snapshot]
     }
+    private let modelCacheRoot: URL?
+    private var catalogRefreshRequestID: UUID?
     private var catalogByAlias: [String: CatalogFacts] = [:]
     /// Audio identities proven by Dictation's own catalog load. ContentView
     /// needs this before AudioView mounts so a voice-lane ready transition
@@ -242,10 +245,12 @@ final class DictationController {
         testingTranscribeCancel: (@MainActor () -> Void)? = nil,
         testingInitialModelPreparationDeferred: Bool? = nil,
         onProductValueDelivered: @escaping @MainActor (ProductValueKind) -> Void = { _ in },
+        modelCacheRoot: URL? = nil,
         audioCatalogLoader: @escaping @MainActor (URL) async -> [ModelEntry]? = {
             await ModelCatalog.audioEntriesIfAvailable(binary: $0)
         }
     ) {
+        self.modelCacheRoot = modelCacheRoot
         self.server = server
         self.client = client
         self.vocabulary = vocabulary ?? DictationVocabulary()
@@ -702,12 +707,27 @@ final class DictationController {
     /// is actually in the cache. Called when the pane opens, when the alias
     /// changes, and when a download finishes.
     func refreshModelCacheState() async {
+        let requestID = UUID()
+        catalogRefreshRequestID = requestID
         guard let binary = server.binaryPath else { return }
         guard let entries = await audioCatalogLoader(binary) else { return }
-        var next: [String: CatalogFacts] = [:]
-        for entry in entries {
-            next[entry.alias] = CatalogFacts(repo: entry.hfRepo, cached: entry.cached)
-        }
+        let cacheRoot = modelCacheRoot ?? BundledModel.userHFCacheURL(
+            environment: ProcessInfo.processInfo.environment,
+            preferredOverride: ModelsFolderPreference.validatedOverrideURL()
+        )
+        // Snapshot enumeration belongs to refresh, off the UI actor. Capture
+        // only performs the bounded stat checks over these immutable facts.
+        let next = await Task.detached(priority: .utility) {
+            var next: [String: CatalogFacts] = [:]
+            for entry in entries {
+                next[entry.alias] = CatalogFacts(
+                    repo: entry.hfRepo, cached: entry.cached,
+                    snapshots: DictationSnapshot.cachedSnapshots(for: entry, cacheRoot: cacheRoot)
+                )
+            }
+            return next
+        }.value
+        guard catalogRefreshRequestID == requestID, !Task.isCancelled else { return }
         catalogByAlias = next
         refreshReadiness()
     }
@@ -966,10 +986,10 @@ final class DictationController {
             return
         }
         // Model Management changes the cache out of process from this
-        // controller. Re-read disk facts on every hotkey press; trusting the
-        // enable-time snapshot here could pass a stale repo to ``serve`` and
+        // controller. Stat the known snapshots on every hotkey press; trusting
+        // the enable-time cached flag could pass a stale repo to ``serve`` and
         // silently redownload a model the user just deleted.
-        let modelOnDisk = await modelIsOnDiskAfterRefresh(requestedAlias)
+        let modelOnDisk = modelIsOnDisk(requestedAlias)
         guard !Task.isCancelled,
               beginRecordingRequestID == requestID,
               isEnabled,
@@ -1007,12 +1027,21 @@ final class DictationController {
         startRecordStartWarmup()
     }
 
-    /// Fresh cache truth used at the recording boundary. Internal so the
-    /// deletion regression can exercise the real catalog refresh without
-    /// requiring microphone or Accessibility grants in the test process.
-    func modelIsOnDiskAfterRefresh(_ alias: String) async -> Bool {
-        await refreshModelCacheState()
-        return catalogByAlias[alias]?.cached == true
+    /// No catalog loader, process, authentication, or directory enumeration
+    /// on the recording boundary. The full refresh resolves repo/revision
+    /// paths when the pane opens, selection changes, or a download finishes.
+    func modelIsOnDisk(_ alias: String) -> Bool {
+        guard let facts = catalogByAlias[alias], facts.cached else { return false }
+        // The legacy audio catalog identifies repositories, not immutable
+        // pins. Without refs/main, conservatively require every inventoried
+        // revision to remain intact; another revision must not hide deletion
+        // of the selected checkpoint. A full refresh can resolve new facts.
+        let present = !facts.snapshots.isEmpty && facts.snapshots.allSatisfy { $0.isOnDisk }
+        if !present {
+            catalogByAlias[alias] = CatalogFacts(repo: facts.repo, cached: false, snapshots: [])
+            refreshReadiness()
+        }
+        return present
     }
 
     /// Fired from the audio thread the moment real samples arrive. Until this
