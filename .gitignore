@@ -65,7 +65,6 @@ reports/benchmarks/ollama-comparison/*.md
 *.pot
 
 # Environments
-.env
 .venv
 .worktrees/
 env/
@@ -79,7 +78,6 @@ venv.bak/
 
 # IDE
 .idea/
-.vscode/
 *.swp
 *.swo
 *~
@@ -160,3 +158,5 @@ rapid_mlx/telemetry/_release_stamp.json
 # written here per run; the contract artifact travels in the PR description,
 # not in git)
 rapid-dev-verify/
+config.bat
+node_modules
