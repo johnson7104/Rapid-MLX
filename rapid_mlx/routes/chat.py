@@ -71,12 +71,14 @@ from ..api.utils import (
     sanitize_content_for_stream,
     sanitize_output,
     sanitize_reasoning_for_stream,
+    strip_special_tokens,
     strip_thinking_tags,
     validate_content_blocks_for_capabilities,
 )
 from ..config import get_config
 from ..engine import GenerationOutput
 from ..middleware.auth import check_rate_limit, verify_api_key
+from ..parsing.prompt_owner import served_model_identity, split_buffered
 from ..request import (
     ClientRequestError,
     InferenceAbortedError,
@@ -6668,6 +6670,7 @@ async def _create_chat_completion_impl(
     # whereas the regex round-trip lost calls whose JSON arguments
     # contained literal harmony sentinel substrings (PR #515 codex
     # round-12 / round-14 BLOCKING).
+    output, channels_owned = split_buffered(output, served_model_identity(cfg))
     engine_tool_calls = getattr(output, "tool_calls", None)
     # LINE① (#558, codex r4 #4) — reasoning-first extraction. When the reasoning
     # gate is engaged (and the engine did NOT already produce structured calls via
@@ -6681,11 +6684,12 @@ async def _create_chat_completion_impl(
     # hermes) never engage line①. ``_line1_split_reasoning_for_tool_parse`` FAILS
     # CLOSED (never returns the raw text), so an engaged gate never re-exposes the
     # think span even on a reasoning-parser error (codex r5 #3).
-    if _line1_gate_engaged and engine_tool_calls is None:
+    if not channels_owned and _line1_gate_engaged and engine_tool_calls is None:
         cleaned_text, tool_calls = _parse_tool_calls_with_parser(
             _line1_split_reasoning_for_tool_parse(cfg.reasoning_parser, output.text),
             request,
             structured_tool_calls=engine_tool_calls,
+            channels_owned=channels_owned,
             finish_reason=output.finish_reason,
         )
         if not tool_calls:
@@ -6699,6 +6703,7 @@ async def _create_chat_completion_impl(
             output.text,
             request,
             structured_tool_calls=engine_tool_calls,
+            channels_owned=channels_owned,
             finish_reason=output.finish_reason,
         )
     undeclared_tool_dropped = _was_undeclared_tool_dropped()
@@ -7006,6 +7011,7 @@ async def _create_chat_completion_impl(
     # the same orchestration without re-implementing it.
     cleaned_text_before_helper = cleaned_text
     cleaned_text, reasoning_text = _finalize_content_and_reasoning(
+        channels_owned=channels_owned,
         # codex r6 BLOCKING #2: pass the ORIGINAL raw text so the
         # reasoning parser sees the bytes the engine actually emitted.
         # Any wire-literal scrub above only touched user-visible
@@ -7107,8 +7113,11 @@ async def _create_chat_completion_impl(
     # Clean and strip thinking tags from content
     final_content = None
     if cleaned_text:
-        final_content = strip_thinking_tags(clean_output_text(cleaned_text))
-        final_content = sanitize_output(final_content)
+        if channels_owned:
+            final_content = strip_special_tokens(cleaned_text)
+        else:
+            final_content = strip_thinking_tags(clean_output_text(cleaned_text))
+            final_content = sanitize_output(final_content)
         if response_format and final_content:
             final_content = extract_json_from_response(final_content)
 
@@ -7185,7 +7194,11 @@ async def _create_chat_completion_impl(
             and reasoning_text
             and not final_content
         )
-        if not deepseek_v4_mid_think and not undeclared_tool_dropped:
+        if (
+            not channels_owned
+            and not deepseek_v4_mid_think
+            and not undeclared_tool_dropped
+        ):
             final_content = _rescue_silent_drop_from_reasoning(
                 final_content,
                 reasoning_text,
@@ -7217,7 +7230,8 @@ async def _create_chat_completion_impl(
             reasoning_text,
             tool_calls,
             finish_reason,
-            include_reasoning_tail=not _uses_deepseek_v4_reasoning(cfg),
+            include_reasoning_tail=not channels_owned
+            and not _uses_deepseek_v4_reasoning(cfg),
         )
 
     if (
@@ -7231,7 +7245,12 @@ async def _create_chat_completion_impl(
         final_content = UNAVAILABLE_TOOL_NOTICE
 
     # Clean only the finalized visible lane; keep raw reasoning boundaries.
-    if cfg.reasoning_parser is not None and request.tools and not engine_tool_calls:
+    if (
+        not channels_owned
+        and cfg.reasoning_parser is not None
+        and request.tools
+        and not engine_tool_calls
+    ):
         final_content = _clean_final_content_tool_envelope(
             final_content,
             request,
@@ -7275,6 +7294,9 @@ async def _create_chat_completion_impl(
         ),
         metrics=_build_response_metrics(output),
     )
+    if channels_owned:
+        chat_response.choices[0].message.reasoning_content = reasoning_text
+        chat_response.choices[0].message.content = final_content
     # ── Response cache — STORE ───────────────────────────────────────
     #
     # Store the assembled response under the key computed at the lookup
@@ -7574,7 +7596,7 @@ async def stream_chat_completion(
                 if field == "reasoning_content"
                 else sanitize_content_for_stream
             )
-            escaped = json.dumps(_sanitize(text))
+            escaped = json.dumps(text if processor.channels_owned else _sanitize(text))
             return f'{_sse_prefix}"{field}":{escaped}{_sse_suffix}'
 
         # Wire truth for content already delivered before the terminal chunk:
@@ -7590,7 +7612,9 @@ async def stream_chat_completion(
             text: str, chunk_logprobs: ChoiceLogProbs | None = None
         ) -> str:
             """Serialize one content delta, preserving requested logprobs."""
-            wire_text = sanitize_content_for_stream(text)
+            wire_text = (
+                text if processor.channels_owned else sanitize_content_for_stream(text)
+            )
             _streamed_content_parts.append(wire_text)
             if not want_logprobs:
                 return _fast_sse_chunk(wire_text, "content")
@@ -7605,6 +7629,8 @@ async def stream_chat_completion(
                     )
                 ],
             )
+            if processor.channels_owned:
+                chunk.choices[0].delta.content = wire_text
             return f"data: {chunk.model_dump_json(exclude_none=True)}\n\n"
 
         # Start the engine and wait only for scheduler admission before
@@ -8499,7 +8525,8 @@ async def stream_chat_completion(
             )
             rejected_only_tool_call = processor.undeclared_tool_dropped
             if (
-                not already_streamed_content
+                not processor.channels_owned
+                and not already_streamed_content
                 and not has_any_tool_calls
                 and not structured_output_requested
                 and not rejected_only_tool_call
@@ -8706,7 +8733,8 @@ async def stream_chat_completion(
                     processor.accumulated_reasoning,
                     None,
                     finish_event.finish_reason,
-                    include_reasoning_tail=not _uses_deepseek_v4_reasoning(
+                    include_reasoning_tail=not processor.channels_owned
+                    and not _uses_deepseek_v4_reasoning(
                         cfg, processor.reasoning_parser
                     ),
                 )

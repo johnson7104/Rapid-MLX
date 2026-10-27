@@ -124,6 +124,8 @@ class StreamingToolContentFilter:
 class StreamingOutputFilter:
     """Recognize native tool wire before applying stateful content cleanup."""
 
+    channels_owned: bool = False
+
     def __init__(
         self,
         tool_filter: ContentFilter,
@@ -145,12 +147,16 @@ class StreamingOutputFilter:
         from ..api.utils import strip_special_tokens
 
         text = self.special.process(self.tool_filter.process(delta))
+        if self.channels_owned:
+            return strip_special_tokens(text)
         return self.sanitizer.process(strip_special_tokens(text))
 
     def flush(self) -> str:
         from ..api.utils import strip_special_tokens
 
         text = self.special.process(self.tool_filter.flush()) + self.special.flush()
+        if self.channels_owned:
+            return strip_special_tokens(text)
         return (
             self.sanitizer.process(strip_special_tokens(text)) + self.sanitizer.flush()
         )

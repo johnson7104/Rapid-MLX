@@ -2836,6 +2836,19 @@ class BatchedEngine(BaseEngine):
             return [*prompt_ids, *suffix_ids], suffix_ids
         return prompt + "".join(_HARMONY_NO_THINKING_SUFFIX_TOKENS), suffix_ids
 
+    def _align_owned_stop_scope(self, kwargs, context) -> None:
+        """Scope stop strings by the same rendered suffix the output owner uses."""
+        scope = kwargs.get("reasoning_stop_scope")
+        if context is None or not getattr(scope, "prompt_owned", False):
+            return
+        from dataclasses import replace
+
+        from ..parsing.prompt_owner import owned_initial_channel
+
+        kwargs["reasoning_stop_scope"] = replace(
+            scope, starts_in_reasoning=owned_initial_channel(context) == "reasoning"
+        )
+
     def _prompt_parse_context(
         self, prompt, thinking, tools, template_kwargs, prefix, messages, num_images=0
     ):
@@ -3890,6 +3903,7 @@ class BatchedEngine(BaseEngine):
         )
         if context is not None and context.template_contract != "unknown":
             kwargs["_on_prompt_prepared"] = capture
+        self._align_owned_stop_scope(kwargs, context)
 
         output = await self.generate(
             prompt=prompt,
@@ -4819,6 +4833,7 @@ class BatchedEngine(BaseEngine):
         )
         if context is not None and context.template_contract != "unknown":
             kwargs["_on_prompt_prepared"] = capture
+        self._align_owned_stop_scope(kwargs, context)
 
         if forced_assistant_prefix and kwargs.get("request_admitted_event") is None:
             kwargs["request_admitted_event"] = asyncio.Event()

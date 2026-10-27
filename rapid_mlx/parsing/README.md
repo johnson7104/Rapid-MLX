@@ -1,8 +1,8 @@
 # Output parser migration core
 
-`OutputDemultiplexer` is a request-local lexer, grammar and commit cursor. Phase
-three introduces it in shadow mode; production parsing remains unchanged until
-the selected format adapters move onto this contract.
+`OutputDemultiplexer` is a request-local lexer, grammar and commit cursor. It was
+introduced in shadow mode; the selected production adapters described below now
+use this contract.
 
 - `ParseContext` carries rendered current-turn evidence and an explicit grammar
   default for unknown prompts. Requested thinking mode alone is not evidence.
@@ -48,3 +48,38 @@ source ownership, terminal lifecycles, native bypass, reducer failures, request
 reset, diagnostic failures, and real-route switch invariance. The 1K/4K/16K/64K
 work-counter test is deterministic; the existing full-postprocessor CPU contract
 remains a strict expected failure until the tool grammar migration.
+
+## Prompt-owned Flint and LFM2.5 output
+
+`PromptOutputOwner` activates from the rendered Flint template contract or the
+LFM2.5 model identity plus `PromptParseContext`. The last current-turn thinking
+opener/closer determines the initial channel; a request's thinking switch does
+not. A bare Flint assistant prefix starts in content. The template renderer no
+longer adds an empty thinking block.
+
+The existing `OutputDemultiplexer` owns split-marker holdback and finalization.
+Its selected grammar preserves tool-looking reasoning and shields content tool
+arguments from reasoning transitions. Chat, Responses and Messages pass only
+content to tool extraction, including buffered replies. Owned reasoning bypasses
+serializer stripping and EOF promotion. Native channel events and other model
+families retain their existing paths.
+
+LFM2.5's native tool-envelope terminals produce control events in content and
+remain literal in reasoning. The existing tool parser receives the pythonic
+payload. Reset restores legacy parser configuration before the next stream.
+
+Remaining migration work includes other families' reasoning parsers and think
+routers, content sanitizers, format-specific tool filters and fallback parsing,
+and API-specific tool serialization/validation. These remain active; this change
+does not install a grammar dependency or introduce new request errors. The
+prompt-owner differential ledger records every change from v0.16.10, including
+unchanged Qwen control cases. The source comments identify the reference rules.
+
+A closing thinking marker without an open reasoning block remains literal output,
+matching the reference detector. Live acceptance must reject such model output;
+the adapter does not hide it with a sanitizer.
+
+Existing non-reasoning control cleanup remains in place. Foreign marker spellings
+are not automatically controls of the selected grammar: for example, LFM's native
+tool envelope is ordinary literal text for Flint. The differential ledger records
+this removal of broad cross-format sanitizer rewriting.

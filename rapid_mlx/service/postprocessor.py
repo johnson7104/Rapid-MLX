@@ -21,6 +21,13 @@ from unittest.mock import Mock
 from ..api.tool_calling import parse_tool_calls
 from ..api.utils import StreamingContentSanitizer, sanitize_output, strip_special_tokens
 from ..domain.events import StreamEvent
+from ..parsing.output_demux import Event
+from ..parsing.prompt_owner import (
+    ContentDelta,
+    PromptOutputOwner,
+    ReasoningDelta,
+    served_model_identity,
+)
 from ..parsing.shadow import make_shadow
 from ..streaming_markers import StreamingMarkerBuffer
 from ..tool_call_authorization import call_name, declared_names, log_drop
@@ -222,6 +229,7 @@ class StreamingPostProcessor:
     ):
         self.cfg = cfg
         self.prompt_parse_context: PromptParseContext | None = None
+        self._prompt_owner = PromptOutputOwner(served_model_identity(cfg))
         if tools_requested is None:
             # Backward-compatible inference for direct/internal callers that
             # already pass the request payload but predate this constructor
@@ -335,6 +343,7 @@ class StreamingPostProcessor:
             self.reasoning_parser = self._create_reasoning_parser(cfg)
         else:
             self.reasoning_parser = cfg.reasoning_parser  # None or injected mock
+        self._legacy_reasoning_parser = self.reasoning_parser
 
         # R10-M1 (2026-06-23): propagate the request-level
         # ``enable_thinking`` to parsers that expose ``set_enable_thinking``
@@ -451,6 +460,7 @@ class StreamingPostProcessor:
         # chunk so clients see ``completion_tokens_details.reasoning_tokens``
         # in parity with the non-streaming response shape. v0.6.63
         # onboarding sweep finding #5.
+        self._reasoning_parts: list[str] = []
         self.accumulated_reasoning = ""
         self.tool_calls_detected = False
         # A malformed Hermes call is deliberately promoted into a rejected
@@ -1588,6 +1598,10 @@ class StreamingPostProcessor:
         the live delta handy; those sites use the strict
         accumulated-buffer signal (sufficient post-first-chunk).
         """
+        if self._prompt_owner.active:
+            # Prompt-selected ownership must inspect content too: an explicit
+            # opener may follow it, regardless of the requested switch.
+            return True
         if self.enable_thinking is not False:
             return True
         # DeepSeek V4's protocol permits a bare ``</think>`` while already
@@ -2491,6 +2505,8 @@ class StreamingPostProcessor:
         because that would clear another active stream's parser state.
         """
         self.prompt_parse_context = None
+        self.reasoning_parser = self._legacy_reasoning_parser
+        self._prompt_owner = PromptOutputOwner(served_model_identity(self.cfg))
         self._parser_shadow = make_shadow(self.cfg, self.tools_requested)
         self.accumulated_text = ""
         self._content_sanitizer = StreamingContentSanitizer()
@@ -2617,6 +2633,7 @@ class StreamingPostProcessor:
                     pass
         if self.tool_parser and self._tool_parser_request_local:
             self.tool_parser.reset()
+            self.tool_parser.skip_reasoning_parsing = False
 
     def process_chunk(self, output: GenerationOutput) -> list[StreamEvent]:
         """Process a single engine output chunk.
@@ -2625,7 +2642,28 @@ class StreamingPostProcessor:
         """
         if getattr(output, "prompt_parse_context", None) is not None:
             self.prompt_parse_context = output.prompt_parse_context
-        events = self._process_chunk_events(output)
+        was_owned = self.channels_owned
+        # Held marker text precedes the native chunk in parser order.
+        released = self._process_owned_events(
+            self._prompt_owner.release_held(output), output
+        )
+        owned = self._prompt_owner.observe(output)
+        if owned is not None:
+            if not was_owned:
+                # The engine replays its forced prefix as the first source span.
+                # The owner consumes it once; undo legacy speculative seeding.
+                self.tool_accumulated_text = ""
+                self._forced_prefix_pending = ""
+            self.reasoning_parser = None
+            if self.tool_parser is not None:
+                self.tool_parser.skip_reasoning_parsing = True
+            events = self._process_owned_events(owned, output)
+            if output.finished:
+                self.accumulated_text = "".join(self._prompt_owner.content)
+                events.append(self._make_finish_event(output))
+        else:
+            events = self._process_chunk_events(output)
+        events = released + events
         if any(event.type == "tool_call" for event in events):
             tail = ""
             if getattr(output, "tool_calls", None):
@@ -2637,6 +2675,40 @@ class StreamingPostProcessor:
         if self._parser_shadow is not None:
             self._parser_shadow.observe(output, events)
         return events
+
+    def _process_owned_events(
+        self, owned: list[Event], output: GenerationOutput
+    ) -> list[StreamEvent]:
+        events = []
+        for event in owned:
+            if isinstance(event, ReasoningDelta):
+                self._reasoning_parts.append(event.text)
+                events.append(StreamEvent(type="reasoning", reasoning=event.text))
+            elif isinstance(event, ContentDelta):
+                chunk = copy.copy(output)
+                chunk.new_text = event.text
+                chunk.finished = False
+                chunk.finish_reason = None
+                events.extend(self._process_standard(event.text, chunk))
+        return events
+
+    @property
+    def accumulated_reasoning(self) -> str:
+        # Owned deltas are collected as fragments and joined on read, so long
+        # streams do not regrow one immutable string per delta.
+        if self._reasoning_parts:
+            self._accumulated_reasoning += "".join(self._reasoning_parts)
+            self._reasoning_parts.clear()
+        return self._accumulated_reasoning
+
+    @accumulated_reasoning.setter
+    def accumulated_reasoning(self, value: str) -> None:
+        self._reasoning_parts.clear()
+        self._accumulated_reasoning = value
+
+    @property
+    def channels_owned(self) -> bool:
+        return self._prompt_owner.active
 
     @staticmethod
     def _insert_content_before_tool_call(
@@ -2792,7 +2864,7 @@ class StreamingPostProcessor:
                         return []
 
         # Step 1: Separate content from reasoning
-        if output.channel is not None:
+        if output.channel is not None or (self.channels_owned and output.tool_calls):
             events = self._process_channel_routed(delta_text, output)
         elif self.reasoning_parser and self._should_route_through_reasoning(delta_text):
             # When enable_thinking is explicitly False, the model is told to
@@ -3859,6 +3931,8 @@ class StreamingPostProcessor:
         already accumulates raw parser input and the standard path does not
         accumulate content. Remember which contract owns the held tail.
         """
+        if self.channels_owned:
+            return content
         self._content_sanitizer_accumulates = accumulate
         content = self._content_sanitizer.process(content)
         if accumulate:
@@ -3866,7 +3940,14 @@ class StreamingPostProcessor:
         return content
 
     def finalize(self) -> list[StreamEvent]:
-        events = self._finalize_legacy()
+        from ..engine.base import GenerationOutput
+
+        events = self._process_owned_events(
+            self._prompt_owner.finish(), GenerationOutput(text="", finished=False)
+        )
+        if self.channels_owned:
+            self.accumulated_text = "".join(self._prompt_owner.content)
+        events += self._finalize_legacy()
         if self._parser_shadow is not None:
             self._parser_shadow.finish(events)
         return events
